@@ -17,6 +17,7 @@ import com.transfer.flash.ui.chat.FlashChatListScreen
 import com.transfer.flash.ui.chat.FlashConversationScreen
 import com.transfer.flash.ui.theme.FlashMaterialTheme
 import com.transfer.flash.ui.theme.FlashTheme
+import dagger.hilt.android.AndroidEntryPoint
 
 /**
  * Showcase host. Provisional demo pages (LAN home, icon/motion QA sheets, experimental
@@ -25,6 +26,7 @@ import com.transfer.flash.ui.theme.FlashTheme
  *
  * Bottom navigation + settings pages land via docs/ui-page-plan.md.
  */
+@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

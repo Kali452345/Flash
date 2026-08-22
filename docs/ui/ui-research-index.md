@@ -75,7 +75,7 @@ Per-component docs use [`component-doc-template.md`](component-doc-template.md).
 | UI-036 | Dynamic color | [design-system.md](design-system.md) | IMPLEMENTED | UI-001, UI-035 |
 | UI-038 | Reduced motion / a11y | [accessibility.md](accessibility.md) | IMPLEMENTED | UI-037 |
 | UI-039 | Haptics | [motion-system.md](motion-system.md) | IMPLEMENTED | UI-037 |
-| UI-040 | Sound feedback | [motion-system.md](motion-system.md) | BLOCKED - owner product decision required | Decision doc required |
+| UI-040 | Sound feedback | [motion-system.md](motion-system.md) | IMPLEMENTED (opt-in, default off — D6 approved 2026-08-22; device QA pending) | UI-037 |
 | UI-041 | Micro-interactions | [motion-system.md](motion-system.md) | IMPLEMENTED | UI-037 |
 | UI-042 | Performance research | [performance.md](performance.md) | IMPLEMENTED (code-level; device numbers pending) | Implemented components |
 | UI-043 | Large conversation stress test | [performance.md](performance.md) | IMPLEMENTED (harness; device runs pending) | UI-021, UI-005 |
@@ -105,5 +105,5 @@ Do not treat it as accepted premium UI.
 ## Next action for AI
 
 1. Read [`flash-premium-chat-ui-implementation.md`](flash-premium-chat-ui-implementation.md).
-2. **UI-034/038/039/041/042/043 IMPLEMENTED (2026-08-22, final parallel round)** — ALL UI-001–045 IDs are now IMPLEMENTED except **UI-040** (BLOCKED on owner product decision: sound feedback) and **UI-045** (quality gate — runs after device verification).
+2. **ALL UI-001–045 IDs are now IMPLEMENTED except UI-045** (quality gate — runs after device verification). UI-040 implemented 2026-08-22 (opt-in sounds, default off).
 3. Device verification is now the critical path. See `logs/handoff.md` testing backlog.

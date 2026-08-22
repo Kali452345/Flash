@@ -7,7 +7,7 @@
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-21); 357 Gradle tasks, all unit tests green.
 
 ## Current phase
-**ALL UI-001–045 IDs IMPLEMENTED (except UI-040 BLOCKED on owner sound decision; UI-045 quality gate intentionally last). Four provisional demo pages REMOVED (icon/motion QA sheets, experimental WS transfer, LAN demo home). Core upgrade plan split: PART 1 = `docs/core-upgrade-plan.md` (core components), PART 2 = `docs/ui-page-plan.md` (pages & bottom nav). Critical path = device verification backlog + owner sign-off on plan decisions D1–D6.**
+**Phase P0 COMPLETE (2026-08-22): C0 foundations landed — FlashProtocol/FlashEnvelope/FlashLogger/FlashTimeSource/FlashIdGenerator in :core:common; Hilt 2.60.1+KSP 2.3.11 graph skeleton in :app (D1 approved); GitHub Actions CI; UI-040 sounds implemented opt-in default-off (D6 approved). 312 tests / 0 failures. Next: Phase P1 (:core:persistence, C1.0–C1.8) per docs/core-upgrade-plan.md §5. All UI-001–045 IMPLEMENTED except UI-045 quality gate (after device verification).**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -71,17 +71,17 @@
 - None.
 
 ## Last change
-Final parallel round: UI-034 (adaptive window classes + two-pane helper), UI-038/039/041 (FlashFeedback haptic choke point with 15 call-site migrations + a11y fixes), UI-042/043 (deterministic stress generator 100–2000 messages through the real FlashMessageList + performance research doc). Lead fixed agent integration issues (missing positionChange import, one over-strict test). Build green; **271 tests / 0 failures across all modules**.
+Phase P0 executed via three parallel research-first subagents (core:common foundations; Hilt skeleton incl. catalog+manifest+MainActivity; FlashSounds + motion-system.md UI-040 section) plus lead work (CI workflow, ADR-011, index updates, one integration fix: ArrayDeque.capacity() → stored maxCapacity in FlashLogger). D1=Hilt, D6=opt-in sounds recorded in decisions.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 271 tests / 0 failures across all modules.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **312 tests / 0 failures** across all modules. Two ERROR-008 daemon kills recovered mid-run per documented procedure.
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
 
 ## Deferred / pending integration (do not forget)
-**Master plans (PROPOSED, awaiting owner sign-off on D1–D6 in PART 1):**
-- **PART 1 — Core:** `docs/core-upgrade-plan.md` — per-component upgrades (C0 foundations → C7 engine facade), abstraction→implementation→exposure per module.
+**Master plans:**
+- **PART 1 — Core:** `docs/core-upgrade-plan.md` **v2 ACTIVE** — D2/D3/D4/D5 approved (ADR-010); D1 + D6 open; execution phases P0–P8 defined.
 - **PART 2 — Pages:** `docs/ui-page-plan.md` — bottom nav shell (Chats/Transfers/Nearby/Settings + Send FAB), page-by-page specs P1–P5 with core-API dependencies, integration checklist.
 
 All items below are absorbed into those two documents:
@@ -99,7 +99,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Device verification backlog (see testing checklist below) is the critical path.** After device pass → UI-045 quality gate. UI-040 needs owner sound decision first.
+**Execute Phase P1 — `:core:persistence` (C1.0 research → C1.1 module → C1.2–C1.8 entities/DAOs/SQLCipher/DataStore/pruner/migration tests)** per `docs/core-upgrade-plan.md`. Device backlog below remains open; add: Hilt-graph smoke check on device + UI-040 sound toggle/tone QA.
 
 ## DEVICE TESTING BACKLOG (for owner)
 Priority order; each item = install latest debug APK, exercise, report pass/fail:

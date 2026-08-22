@@ -1,5 +1,41 @@
 # Decisions
 
+## ADR-011 - D1 = Hilt; D6 = opt-in subtle sounds (default off); Phase P0 executed
+
+### Decision
+Owner approved (2026-08-22):
+- **D1:** Hilt (2.60.1, KSP 2.3.11) as the DI framework. Graph lives in `:app` (`:core:*` modules stay DI-agnostic, constructor-injected), per plan C0.5.
+- **D6:** Sound feedback = subtle synthesized procedural tones, **opt-in with default OFF** (settings toggle persists via DataStore in C1.5). Unblocks UI-040.
+- Phase P0 executed same session: `FlashProtocol`/`FlashEnvelope`, `FlashLogger` ring buffer, `FlashTimeSource`/`FlashIdGenerator` (:core:common), Hilt graph skeleton + `FlashApplication`, GitHub Actions CI (C0.6), UI-040 sound system (`FlashSounds`) implemented in :ui:theme.
+
+### Context
+Hilt chosen over Koin (compile-time safety, standard tooling) and manual DI (brittle at scale); verified compatible with AGP 9.3.1/Kotlin 2.2.10 via research (Dagger ≥2.59 requires AGP ≥9 — satisfied). Sounds chosen opt-in/off to match reduce-motion philosophy (motion/a11y-first app) until owner opts in.
+
+### Alternatives considered
+Koin (runtime-only error detection), manual AppContainer (fine now, brittle later); asset-based sounds (ships binaries for what synthesis covers), default-on tones (rejected by a11y philosophy).
+
+### Revisit when
+Capability-flag version negotiation if a second protocol consumer appears (Windows/Linux client); sound call-site wiring when real messaging engine lands (C6).
+
+## ADR-010 - Core upgrade decisions D2/D3/D4/D5 approved; plan v2 adopted
+
+### Decision
+Owner approved (2026-08-22) during the core-plan iteration session:
+- **D2:** SQLCipher full-database at-rest encryption, key wrapped in AndroidKeyStore.
+- **D3:** SHA-256 (java.security, zero deps) for chunk/message hashes and fingerprints.
+- **D4:** Frame-level E2E implemented in C2 — ECDH P-256 → HKDF → AES-GCM per paired peer, layered on TLS.
+- **D5:** Mesh relay is post-v1; v1 = direct P2P only (hop-count seams reserved).
+- Plan `docs/core-upgrade-plan.md` rewritten to **v2**: fine-grained research-first steps, UI-dependency inventory, continuous identity-aware discovery, resilient network upgrades, multi-stream transfer, exhaustive messaging API surface.
+
+### Context
+UI roadmap complete on sample data; the finished screens define exact required inputs (`isVerified`, presence, typing names, transfer telemetry, pairing events). Core must be a reusable library (no app/UI deps) and every implementation step must begin with cited web research.
+
+### Alternatives considered
+Keystore-wrapped field encryption only (rejected — weaker than owner-approved full-database option); BLAKE3 (deferred — zero-dep SHA-256 sufficient until benchmarks say otherwise); mesh relay in v1 (rejected — scope).
+
+### Revisit when
+D1 (Hilt vs Koin vs manual) still needs explicit sign-off before C0.5; D6 (sound feedback) blocks UI-040. Benchmarks may revisit hash choice after EXP entries exist.
+
 ## ADR-009 - FlashText primitive: chat text renders through the design system, not material3.Text
 
 ### Decision

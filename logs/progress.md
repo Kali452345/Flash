@@ -1,6 +1,55 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 — Phase P0 Executed (C0 Foundations) + UI-040 Sound Unblocked
+
+### Worked on
+Owner approved D1 (Hilt) and D6 (subtle opt-in sounds, default off); executed core plan Phase P0 via three parallel research-first subagents with strict file ownership; lead ran one consolidated build and fixed integration issues.
+
+### Changed
+- **C0.1–C0.4 (`:core:common`, new files only):** `protocol/FlashProtocol` (VERSION=2, exact-match `isCompatible`, assert-on-handshake rationale w/ citations), `protocol/FlashEnvelope` (validated shared wire container), `logging/FlashLogger` (bounded thread-safe ring buffer, 512 default, Android Log forwarding wrapped JVM-safe) + `FlashLogEntry/Level`, `time/FlashTimeSource` + `SystemTimeSource` (+ test-source `FakeTimeSource`), `id/FlashIdGenerator` + `UuidIdGenerator`. JUnit4 tests for all.
+- **C0.5 (Hilt DI skeleton in `:app`):** version catalog `hilt=2.60.1`, `ksp=2.3.11` (KSP2 standalone required by AGP 9 built-in Kotlin; Dagger ≥2.59 requires AGP ≥9 — satisfied by 9.3.1). Root plugins declared apply-false; app applies ksp+hilt; `di/FlashAppModule.kt` (@AppScope/@IoDispatcher/@DefaultDispatcher qualifiers nowinandroid-style, app CoroutineScope singleton, SampleFlashChatRepository provider), `di/FlashApplication.kt` (@HiltAndroidApp, registered in manifest), `MainActivity` annotated @AndroidEntryPoint. Composables not yet rewired (later phases).
+- **C0.6:** `.github/workflows/ci.yml` — JDK17 temurin, `testDebugUnitTest assembleDebug` on push/PR, test-report artifact on failure.
+- **UI-040 (D6 unblocked):** `ui/theme/FlashSounds.kt` — `FlashSound` enum (8 procedural PCM tone events), `ToneSegment`, `FlashSoundPolicy.shouldPlay` (respects enabled-flag + ringer silent/vibrate + DND interruption filter), `FlashSoundSettings` mutableStateOf bridge (default OFF; DataStore persistence lands C1.5), `FlashSoundSynth` pure-JVM renderer, `rememberFlashSounds()` composable + AudioTrack MODE_STATIC player (per Android guidance for short UI sounds, USAGE_ASSISTANCE_SONIFICATION). Full section added to `docs/ui/motion-system.md` w/ cited research; ui-research-index updated → **ALL UI-001–045 IMPLEMENTED except UI-045 gate**.
+- **Docs:** ADR-011 (D1/D6 decisions + P0 execution) in `docs/decisions.md`.
+
+### Verification
+- Consolidated `testDebugUnitTest assembleDebug`: **BUILD SUCCESSFUL, 312 tests / 0 failures** (was 271; +41 new).
+- Two ERROR-008 E:-drive daemon kills during the run; recovered per documented procedure (`--stop`, kill java, fresh no-daemon rerun).
+- Lead fix: `FlashLogger.kt` used nonexistent `ArrayDeque.capacity()` → replaced with stored `maxCapacity` bound check (smallest-fix rule).
+- NOT yet device-verified: Hilt runtime graph (needs installDebug launch), sound tones on hardware (silent/DND enforcement QA → backlog).
+
+### Remaining
+- Phase P1 (persistence module) is next per plan §5.
+- Wire FlashSound call sites when real send/receive paths exist (documented in motion-system.md interaction table).
+- Device backlog: add Hilt-graph smoke check + UI-040 toggle/tone QA items.
+
+### Next AI
+Start P1 (C1.0 research → C1.1 module creation). Keep R1 research-first discipline; :core:* modules must stay DI-agnostic.
+
+## 2026-08-22 — Core Plan v2: UI-dependency audit + extensive step breakdown
+
+### Worked on
+Owner directed an iteration on `docs/core-upgrade-plan.md` grounded in what the finished UI actually needs, plus specific feature asks (continuous discovery, multi-stream transfer, full security stack, exhaustive messaging API).
+
+### Changed
+- **UI requirements audit:** two parallel research passes mined all 30+ `docs/ui/*.md` docs; produced capability→module map (§3.1) and explicit sample-data limitation list (§3.2) now embedded in the plan.
+- **Web research (cited in plan §7):** NsdManager continuous discovery (API 34+ `registerServiceInfoCallback`, deprecated `resolveService`, NetworkRequest-scoped discovery), LocalSend protocol v2 (parallel upload routes, sha256 chunk verification, resumable uploads), offline-first chat sync patterns (durable outbox, pull-before-push delta sync, cursor receipts with furthest-forward merge, ephemeral-vs-durable state separation).
+- **Plan rewritten to v2:** binding ground rules incl. mandatory research-first per step (R1) and reusable-library purity (R2); owner decision table (D2 SQLCipher / D3 SHA-256 / D4 E2E-in-C2 / D5 mesh-post-v1 approved; D1 DI + D6 sound still open); C0–C7 expanded from ~40 coarse steps to ~80 fine-grained steps each with research/acceptance hooks; new behavior contract for discovery (`startAll(identity)` = advertise own details + continuous browsing with lost-peer aging); network resilience upgrades enumerated (backoff+jitter, NetworkCallback instant reconnect, heartbeat dead-peer detection, bounded per-peer queues, session coalescing); multi-stream transfer as explicit feature (C5.7) with benchmark-before-defaults rule; messaging section lists complete screen-facing API surface.
+- **ADR-010** added to `docs/decisions.md` recording D2/D3/D4/D5 approvals.
+
+### Why
+Everything visible runs on sample data; the UI docs define exact required inputs. The old plan was too coarse for accurate development and lacked the audit trail the owner wants.
+
+### Verification
+Documentation only — no code touched, build state unchanged (last green: 271 tests, 2026-08-22).
+
+### Remaining
+Owner sign-off on **D1 (DI framework)** before C0.5 and **D6 (sound)** before UI-040. Execution starts at Phase P0 once owner says go.
+
+### Next AI
+Start C0 after confirming D1. Follow R1 (research-first) for every step. Never run Gradle if working as a subagent; lead runs one consolidated build.
+
 ## 2026-08-22 - Demo Pages Removed + Plan Split into Core/Pages Parts
 
 ### Worked on

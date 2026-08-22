@@ -1,11 +1,11 @@
 ﻿# Flash Motion Design System
 
-**Status:** IMPLEMENTED (UI-037 foundation; UI-039 + UI-041 appended below)  
-**Component ID:** UI-037; **UI-039** haptics; **UI-041** micro-interactions  
+**Status:** IMPLEMENTED (UI-037 foundation; UI-039 + UI-041 + UI-040 appended below)  
+**Component ID:** UI-037; **UI-039** haptics; **UI-041** micro-interactions; **UI-040** sound feedback  
 **Last updated:** 2026-08-22  
 **Depends on:** UI-001 (Flash Pulse design system)  
 **Master plan:** [flash-premium-chat-ui-implementation.md](flash-premium-chat-ui-implementation.md)  
-**Code:** `app/src/main/java/com/transfer/flash/ui/theme/FlashMotion.kt`, `FlashMotionSheet.kt`
+**Code:** `app/src/main/java/com/transfer/flash/ui/theme/FlashMotion.kt`, `FlashMotionSheet.kt`, `ui/theme/src/main/java/com/transfer/flash/ui/theme/FlashFeedback.kt`, `ui/theme/src/main/java/com/transfer/flash/ui/theme/FlashSounds.kt`
 
 ---
 
@@ -228,7 +228,7 @@ Identical timings; no separate dark motion palette.
 
 ## Known limitations
 
-- UI-040 sound not implemented; UI-039 haptics + UI-041 micro-interactions now documented/implemented below.
+- ~~UI-040 sound not implemented~~ — implemented 2026-08-22, full section below.
 - `screenTransition` not wired to navigation yet (UI-033).
 - No automated test for system reduce-motion setting on device (manual QA).
 
@@ -499,3 +499,251 @@ documented gaps, not silent rewrites.
 - Tokenize `FlashSendButton` + swipe snap-back springs (owner: UI-011/UI-010 passes).
 - Send-success micro-interaction after UI-013 exposes a send-result callback.
 - Optional `FlashPressable` helper modifier if a fourth press-scale copy-paste appears.
+
+---
+
+# UI-040 — Sound Feedback (appended 2026-08-22)
+
+**Status:** IMPLEMENTED (code + JVM tests; device QA pending — no Gradle/device run this session)  
+**Decision record:** Owner approved **subtle synthesized tones, OPT-IN, DEFAULT OFF** on 2026-08-22 (today). Settings persistence lands later via DataStore in core phase C1.5; until then the enable flag lives in an in-memory `mutableStateOf` bridge (`FlashSoundSettings`).  
+**Code:** `ui/theme/src/main/java/com/transfer/flash/ui/theme/FlashSounds.kt`  
+**Tests:** `ui/theme/src/test/java/com/transfer/flash/ui/theme/FlashSoundsTest.kt` (pure JVM, JUnit 4 — no Robolectric)  
+**Depends on:** UI-039 (`FlashFeedback.kt` structure mirrored), UI-001 tokens (no visual tokens consumed)
+
+## Component
+
+`FlashSound` (semantic vocabulary + per-event synthesis spec), `FlashSoundPolicy`
+(pure decision logic), `FlashSoundSettings` (temporary opt-in state bridge),
+`FlashSoundSynth` (pure PCM waveform math — zero Android imports at runtime),
+`rememberFlashSounds()` (single composition choke point),
+`FlashSoundPlayer` (internal AudioTrack backend).
+
+## Purpose
+
+Mirror the UI-039 haptic choke point for audio: components express *intent*
+(`MessageSent`) and never touch `android.media` directly, so tuning pitches,
+changing the playback backend, or muting everything is a one-file change.
+Sounds are a **supplementary** channel layered on top of visuals + haptics —
+never the sole carrier of state information.
+
+## Research sources
+
+| Source | What was studied |
+|---|---|
+| [`AudioTrack` API reference](https://developer.android.com/reference/android/media/AudioTrack) | "Static mode should be chosen when dealing with short sounds that fit in memory… preferred for UI and game sounds that are played often, with smallest overhead possible"; `MODE_STATIC`, `PERFORMANCE_MODE_LOW_LATENCY`, `reloadStaticData()` reuse |
+| [`SoundPool` API reference](https://developer.android.com/reference/android/media/SoundPool) | Pre-decodes resources/files into 16-bit PCM; `load()` accepts only APK resources/assets/file paths — **no raw in-memory buffer API**; 1 MB per-sound cap |
+| [AOSP audio latency design](https://source.android.com/docs/core/audio/latency/design) | Both SoundPool and ToneGenerator request `AUDIO_OUTPUT_FLAG_FAST`; Java AudioTrack can reach the fast mixer path |
+| [Ackee — High Performance Audio APIs](https://www.ackee.agency/blog/android-high-performance-audio-apis) | Comparison: SoundPool = short existing clips; AudioTrack MODE_STATIC = same latency class but accepts *generated* raw data |
+| [SO: AudioTrack/SoundPool/MediaPlayer choice](https://stackoverflow.com/questions/13527134/audiotrack-soundpool-or-mediaplayer-which-should-i-use) | SoundPool needs fully-loaded clips + load callbacks; MediaPlayer too heavy for tones |
+| [SO: Playing an arbitrary tone / generated PCM](https://stackoverflow.com/questions/16084316/generate-a-sound-pcm-android-java) and [siliconfish tone-generator write-up](http://blog.workingsi.com/2012/03/android-tone-generator-app.html) | Procedural sine → 16-bit PCM pattern; phase discontinuities/waveform not ending at zero cause audible clicks → envelope required |
+| [`AudioAttributes` reference](https://developer.android.com/reference/android/media/AudioAttributes) | `USAGE_ASSISTANCE_SONIFICATION` = "sonification, such as with user interface sounds" |
+| [AOSP audio attributes](https://source.android.com/docs/core/audio/attributes) | `USAGE_ASSISTANCE_SONIFICATION` + `CONTENT_TYPE_SONIFICATION` maps to legacy `STREAM_SYSTEM` volume (system volume, not media/notification); HAL context SYSTEM_SOUND |
+| [AOSP `AudioAttributes.java`](https://android.googlesource.com/platform/frameworks/base/+/master/media/java/android/media/AudioAttributes.java) | Sonification usages are classified `SUPPRESSIBLE_SYSTEM` → **muted automatically by Zen/DND when priority mode disallows system sounds** |
+| [`NotificationManager` interruption filter](https://developer.android.com/reference/kotlin/android/app/NotificationManager) | `getCurrentInterruptionFilter()`: ALL=1 normal; PRIORITY/ALARMS/NONE suppress system sounds; UNKNOWN=0 means filter unavailable |
+| [`AudioManager` ringer mode](https://developer.android.com/reference/android/media/AudioManager) | `getRingerMode()`: `RINGER_MODE_SILENT` / `RINGER_MODE_VIBRATE` mean user wants quiet |
+
+No proprietary sounds or third-party audio libraries were used.
+
+## Existing approaches studied
+
+### A — Asset-based `SoundPool` (ship .ogg/.wav chimes)
+
+**Pros:** Lowest runtime CPU (pre-decoded); classic UI-sound path; stream mixing built in.  
+**Cons:** Requires binary assets (owner explicitly wants none unless clearly better); cannot feed
+procedurally generated buffers (`load()` has no byte[] overload); load-callback bookkeeping;
+assets need professional sound design to not sound cheap. **Rejected** for this app.
+
+### B — `ToneGenerator`
+
+**Pros:** One-liner DTMF/beep tones; framework-managed.  
+**Cons:** Fixed preset tone table only (no custom two-note chimes or double-buzz);
+legacy `STREAM_*` volume routing; no envelope control (harsh clicks). **Rejected.**
+
+### C — `Oboe`/AAudio native low-latency synth
+
+**Pros:** Pro-audio grade latency (~10 ms round trip).  
+**Cons:** NDK toolchain + CMake dependency in a pure-Kotlin theme module; massive overkill
+for ≤400 ms opt-in UI chimes where ±20 ms start latency is imperceptible. **Rejected.**
+
+### D — Procedural PCM into `AudioTrack` MODE_STATIC (chosen)
+
+**Pros:** Zero shipped assets; exact control of pitch/envelope (click-free attack+decay);
+official docs recommend static mode precisely for often-played short UI sounds;
+pure-JVM-testable synthesis separated from Android classes; one AudioTrack per event,
+created lazily on first play and reused via `reloadStaticData()`.  
+**Cons:** Synthesis cost on first play per event (~10–18 k samples — negligible, off critical
+path); manual lifecycle/error handling around `IllegalStateException`. **Selected.**
+
+## What worked
+
+- Sine + exponential-decay envelope with short linear attack (~5 ms) and ~3 ms fade-out:
+  click-free per the siliconfish/SO findings about waveforms not ending at zero.
+- `USAGE_ASSISTANCE_SONIFICATION` + `CONTENT_TYPE_SONIFICATION`: routes to **system**
+  volume (not media, not notification) and is auto-suppressed under restrictive Zen modes.
+
+## What did not work
+
+- Considering `SoundPool` directly: its public `load()` API simply has no in-memory-buffer
+  overload — would have required writing temp files to disk, which is worse than AudioTrack.
+- Naive sine without envelope audibly clicks at segment boundaries (documented failure from
+  research; avoided by construction rather than discovered by device testing).
+
+## Chosen approach
+
+```kotlin
+enum class FlashSound(val spec…) { MessageSent, MessageDelivered, MessageReceived,
+    RecordingStart, RecordingStop, TransferComplete, PairingSuccess, Error }
+
+object FlashSoundPolicy {
+    fun shouldPlay(soundsEnabled, ringerMode, interruptionFilter): Boolean
+}
+
+object FlashSoundSettings { var soundsEnabled: Boolean }   // mutableStateOf, default FALSE
+
+object FlashSoundSynth {                                   // pure, JVM-testable
+    fun render(sound: FlashSound, sampleRateHz: Int = 44_100): ShortArray
+    fun totalDurationMs(sound: FlashSound): Long
+    fun dominantFrequencyHz(sound: FlashSound): Double
+}
+
+@Composable fun rememberFlashSounds(): (FlashSound) -> Unit // choke point
+internal object FlashSoundPlayer                            // AudioTrack MODE_STATIC cache
+```
+
+Tone map (44 100 Hz mono, 16-bit PCM; amplitude peak-relative):
+
+| Event | Segments (freq Hz × duration ms) | Peak amp | Character |
+|---|---|---|---|
+| `MessageSent` | 880×60 → 1320×70 | 0.50 | higher rising pair ("wing up") |
+| `MessageDelivered` | 1174.66×90 | 0.45 | single bright tick |
+| `MessageReceived` | 659.25×120 | 0.35 | softer, lower, longer decay |
+| `RecordingStart` | 740×80 | 0.45 | neutral mid blip |
+| `RecordingStop` | 493.88×100 | 0.40 | descending settle |
+| `TransferComplete` | 1046.5×60 → 1318.5×60 → 1568×110 | 0.50 | rising triad flourish |
+| `PairingSuccess` | 587.33×80 → 880×140 | 0.50 | two-note major confirmation |
+| `Error` | 196×130 → rest×60 → 196×130 | 0.55 | dull low double-buzz |
+
+Envelope per segment: linear attack ≈5 ms → exponential decay (τ = duration/3, ends ≈ −21 dB)
+→ final ≈3 ms fade-out. All values live in one table in `FlashSounds.kt`.
+
+## Why it was chosen
+
+Owner decision (opt-in/default-off, no binary assets) plus platform guidance: Android's own
+docs name AudioTrack static mode as the recommended mechanism for exactly this use case, and
+the usage attribute gives correct volume-group + DND semantics for free. Separating
+`FlashSoundSynth` (pure math) from `FlashSoundPlayer` (Android media) keeps every waveform
+property unit-tested on the JVM without Robolectric, matching the UI-039 test philosophy.
+
+## System-state respect rules
+
+1. `soundsEnabled == false` (default) → **zero work**: policy returns false before any player
+   init, track creation, or synthesis. No AudioTrack object exists until first enabled play.
+2. Ringer mode `SILENT` or `VIBRATE` → never play (user wants quiet).
+3. Interruption filter `PRIORITY`, `ALARMS`, or `NONE` (DND active) → never play. Filter
+   `UNKNOWN` is treated as allowed because reading it failed — belt-and-braces only, since
+   `USAGE_ASSISTANCE_SONIFICATION` is already OS-classified `SUPPRESSIBLE_SYSTEM`.
+4. Volume: tones follow the **system/ringer volume group** via the usage attribute — they
+   neither blast over music (media volume) nor behave like notifications.
+5. Policy checks happen at play time (not cached), so flipping the silent switch mid-session
+   takes effect on the very next event.
+
+## Accessibility requirements
+
+- Sounds are **always supplementary**: no state may be conveyed *only* by sound; delivery/
+   pairing/recording states have visual (UI-038) and haptic (UI-039) counterparts.
+- TalkBack announcements are unaffected — this system plays nothing through the
+   accessibility channel and does not intercept announcements.
+- Default OFF respects users who find UI sounds noisy; the toggle (when surfaced) must be a
+   real setting, not buried.
+- Error events pair with visible error states and `Reject`/`Warn` haptics, not sound alone.
+
+## Interaction specification (call sites to wire later — NOT yet wired)
+
+The repo currently has no message-send/deliver/receive pipeline in the chat UI layer, so no
+call sites were modified (file ownership limited to FlashSounds.kt/tests/doc). When the real
+data flow lands, fire these once per discrete event:
+
+| Event | Where it should fire (future owner) |
+|---|---|
+| `MessageSent` | send-result success callback after UI-013 composer send completes (also closes UI-041 gap #3) |
+| `MessageDelivered` | delivery-status transition observer (same place `FlashDeliveryStatusIcon` flips state) |
+| `MessageReceived` | incoming-message insert into conversation list (UI-021 data layer) |
+| `RecordingStart` / `RecordingStop` | `FlashVoiceRecording` start/cancel-or-commit handlers (pair with existing `Confirm`/`Reject` haptics) |
+| `TransferComplete` | transfer engine completion event surfaced to chat UI |
+| `PairingSuccess` | pairing flow success handler |
+| `Error` | send-failure / transfer-failure surfaces (pair with `Reject` haptic) |
+
+Rule: new call sites must use `rememberFlashSounds()` (or the player via settings/policy) —
+direct `android.media` usage in feature modules is prohibited, mirroring the UI-039 rule.
+
+## Animation specification
+
+None — tones are instantaneous one-shots (60–320 ms). They are event-driven like haptics;
+never trigger from per-frame animation callbacks.
+
+## Gesture specification
+
+None direct. Recording gestures fire `RecordingStart`/`RecordingStop` alongside the existing
+UI-039 haptics at the same discrete gesture boundaries (press-to-record, discard/commit).
+
+## Responsive behavior / Dark-mode behavior
+
+N/A (non-visual channel). Same tones on all form factors.
+
+## Performance considerations
+
+- First-play synthesis per event: ≤ ~14 k samples (≈57 KB ShortArray) — sub-millisecond on
+  any modern device; cached thereafter (both PCM and AudioTrack).
+- One AudioTrack instance per event type held after first play (8 max ≈ <500 KB total);
+  trivially releasable if a teardown hook is needed later.
+- Static-mode tracks request the fast-mixer path where available (per AOSP latency docs).
+- Play calls are cheap (`stop → reloadStaticData → play`); guarded against
+  `IllegalStateException` from racing stop/release during process teardown.
+
+## Implementation notes
+
+- `FlashSoundSettings.soundsEnabled` is a `mutableStateOf`-backed singleton property — a
+  **deliberate temporary bridge** until DataStore wiring in core phase C1.5 replaces it with
+  persisted state. Compose can observe it today; swap its backing implementation without
+  touching call sites.
+- `FlashSoundPolicy.shouldPlay` takes primitive ints for ringer/interruption state so it stays
+  JVM-testable; the constants referenced in defaults are compile-time `static final int`s,
+  safe in unit tests.
+- Unit tests cover: rendered length == Σduration·sampleRate/1000; bounded amplitude;
+  monotonic post-attack decay of positive peaks; silence gap in `Error`; zero-crossing
+  frequency estimate within tolerance of spec; distinct dominant frequency across all 8
+  events; full policy truth table; vocabulary freeze.
+- Device QA pending (no Gradle/device run this session — Gradle forbidden here): confirm
+  perceived loudness/balance on Pixel + Samsung speakers, confirm silent/DND behavior on
+  physical devices, record in `logs/experiments.md` per AGENTS.md §23.
+
+## Testing checklist
+
+- [x] Pure-JVM synthesis tests (`FlashSoundsTest.kt`): length, envelope decay, frequencies, gap silence, bounds
+- [x] Policy truth-table unit tests (enabled flag, ringer modes, all interruption filters)
+- [x] Vocabulary freeze guard (8 documented events, distinct dominant frequencies)
+- [ ] Physical device: each tone feels subtle & appropriate; volumes balanced
+- [ ] Physical device: ringer SILENT/VIBRATE and each DND level mute all tones
+- [ ] Media-volume-only scenarios: tones inaudible at zero system volume
+- [ ] TalkBack session: no interference with announcements
+
+## Known limitations
+
+- **Persistence bridge pending C1.5:** `soundsEnabled` is in-memory only; resets to OFF on
+  process death until DataStore-backed settings land. Documented, intentional.
+- **Call sites not wired:** no production event fires sounds yet (see Interaction
+  specification table); lead must wire send/receive/delivery/pairing/transfer hooks as those
+  flows materialize.
+- Device QA pending: loudness balance, silent/DND enforcement, speaker-vs-earpiece variance
+  untested (Gradle forbidden this session).
+- Tones are fixed specs in-code; no per-device loudness normalization (device-dependent
+  speaker gain may vary — revisit after QA).
+- `FlashSoundPlayer` holds up to 8 small AudioTrack instances for process lifetime once
+  sounds have been used while enabled; acceptable footprint, add release hook only if needed.
+
+## Future improvements
+
+- DataStore persistence + settings-screen toggle (core C1.5).
+- Wire call sites per the interaction table as data flows land.
+- Optional per-event enable matrix ("sent yes / received no") behind the same policy gate.
+- Consider `PERFORMANCE_MODE_LOW_LATENCY` flag after measuring first-play latency on device.
