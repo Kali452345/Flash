@@ -1,6 +1,34 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 — Phase P1 Executed (:core:persistence — Room + SQLCipher + DataStore)
+
+### Worked on
+Executed core plan Phase P1 (C1.0–C1.8) via two parallel research-first subagents with strict file ownership; lead scaffolded module/build config, ran one consolidated build, fixed two integration issues.
+
+### Changed
+- **C1.0 research (lead):** Room 3.0 went stable 2026-07 (new `androidx.room3` package, SQLiteDriver-based, breaks SupportSQLite); SQLCipher added Room 3 support only in 4.18.0 (2026-08-18). **Decision: Room 2.8.4** (mature SupportOpenHelperFactory path) + **SQLCipher 4.18.0** (`net.zetetic:sqlcipher-android@aar`) + DataStore preferences 1.1.7 + Robolectric 4.16.1 (DAO tests pinned @Config sdk=[34]; SDK 36 needs JDK 21). Room 3 migration = documented revisit point.
+- **Module scaffold (lead):** `settings.gradle.kts` include, version catalog entries (room/sqlcipher/sqlite/datastore/coroutines-test/robolectric), `core/persistence/build.gradle.kts` (ksp room-compiler, room.schemaLocation export to `schemas/`, maven-publish, test assets), rules.pro stubs.
+- **C1.2–C1.4 (agent A):** 11 entities (Message/Conversation/Receipt/Outbox/Transfer/TransferChunk/RecentSearch/TrustedPeer/Reaction/Draft/ReadCursor), 11 DAOs (Flow reads; IGNORE dedup on messages/receipts; @Upsert last-write-wins for drafts/reactions/recents/cursors; keyset pagination `(sentAt<c)OR(=AND localId<)` with PK tiebreaker; composite seek index on (conversationId,sentAt,localId)), `FlashDatabase` v1 exportSchema=true, `FlashDatabaseOpener` (openEncrypted via System.loadLibrary("sqlcipher")+SupportOpenHelperFactory+PassphraseProvider seam; openInMemory test-only w/ loud destructive-migration comment).
+- **C1.8 invariant tests (agent A):** Robolectric in-memory suite — duplicate message/receipt IGNORE, outbox claim→attempts→delete→re-claim-empty race semantics, read-cursor monotonicity (advanceFurthest transactional read-compare-write, older/equal no-op), keyset walk of 50 msgs / page 7 / tie-heavy no-dup-no-gap per-conversation scoping, chunk done-set resume bit-vector roundtrip + resetStuck.
+- **C1.5–C1.6 (agent B):** `FlashSettingsDataStore` — all 9 plan keys incl. soundsEnabled default FALSE (D6), dynamicAccent, reduceMotionOverride, saveLocationUri, retentionDays, displayName; Flow readers + suspend writers, ReplaceFileCorruptionHandler(emptyPreferences), JVM-testable produceFile constructor (DataStore prefs is KMP-JVM capable per docs; plain-JVM tests over Robolectric). `RetentionPolicy` pure policy class (strictly-older cutoff, protected entries spared, retentionDays<=0 disables = keep-forever) + `PrunableSource` seam for the future DB-backed worker (C6/C7 hook).
+- 21 new tests total across settings/retention/db packages.
+
+### Verification
+- Consolidated `testDebugUnitTest assembleDebug`: **BUILD SUCCESSFUL, 340 tests / 0 failures** (was 312).
+- Room schema v1 exported: `core/persistence/schemas/com.transfer.flash.core.persistence.db.FlashDatabase/1.json` (in-repo, C1.7 baseline before any migration exists).
+- Lead fixes: missing androidx.room imports in ReadCursorDao (KSP MissingType PROCESSING_ERROR); non-Comparable kotlin.Pair `<` in keyset walk test → explicit composite comparison.
+- Three ERROR-008 E:-drive incidents this session (Gradle lock-file write failures + Kotlin daemon NoClassDefFoundError crashes); each recovered via --stop/kill-java/fresh no-daemon rerun. Pattern worsening — see Known blockers.
+
+### Remaining
+- SQLCipher encrypted-open path is compile-verified but NOT runtime-verified (native lib requires device/emulator) — add device smoke item: open DB encrypted, write/read row, reopen.
+- Keystore-wrapped passphrase provider lands with C7/:app wiring.
+- Retention pruner DB-backed worker (needs WorkManager decision) deferred to C6/C7.
+- Next phase: P2 (:core:security full stack, C2.0–C2.8).
+
+### Next AI
+Start P2 per plan §5. R1 research-first every step. :core:* stay DI-agnostic. Beware E:-drive flakiness — commit incrementally.
+
 ## 2026-08-22 — Phase P0 Executed (C0 Foundations) + UI-040 Sound Unblocked
 
 ### Worked on

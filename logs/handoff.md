@@ -4,10 +4,10 @@
 `main` — remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
 
 ## Last verified build
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-21); 357 Gradle tasks, all unit tests green.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 374 Gradle tasks, **340 tests / 0 failures**.
 
 ## Current phase
-**Phase P0 COMPLETE (2026-08-22): C0 foundations landed — FlashProtocol/FlashEnvelope/FlashLogger/FlashTimeSource/FlashIdGenerator in :core:common; Hilt 2.60.1+KSP 2.3.11 graph skeleton in :app (D1 approved); GitHub Actions CI; UI-040 sounds implemented opt-in default-off (D6 approved). 312 tests / 0 failures. Next: Phase P1 (:core:persistence, C1.0–C1.8) per docs/core-upgrade-plan.md §5. All UI-001–045 IMPLEMENTED except UI-045 quality gate (after device verification).**
+**Phase P1 COMPLETE (2026-08-22): :core:persistence landed — Room 2.8.4 (11 entities + 11 DAOs, keyset pagination, IGNORE/upsert semantics), SQLCipher 4.18.0 encrypted opener w/ PassphraseProvider seam, FlashSettingsDataStore (9 keys incl. soundsEnabled default-off), RetentionPolicy + PrunableSource seam, schema v1 exported in-repo, invariant tests green (dedup / outbox-race / cursor-monotonicity / keyset-walk / chunk-bitvector). P0 (C0 foundations + Hilt + CI + UI-040 sounds) done earlier same day; 340 tests total. Next: Phase P2 (:core:security C2.0–C2.8). All UI IDs IMPLEMENTED except UI-045 quality gate (after device verification).**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -71,10 +71,10 @@
 - None.
 
 ## Last change
-Phase P0 executed via three parallel research-first subagents (core:common foundations; Hilt skeleton incl. catalog+manifest+MainActivity; FlashSounds + motion-system.md UI-040 section) plus lead work (CI workflow, ADR-011, index updates, one integration fix: ArrayDeque.capacity() → stored maxCapacity in FlashLogger). D1=Hilt, D6=opt-in sounds recorded in decisions.
+Phase P1 executed: :core:persistence created (Room 2.8.4 + SQLCipher 4.18.0 + DataStore). Two research-first subagents (db entities/DAOs/opener/invariants; settings/retention) under strict file ownership; lead scaffolded build config, added room.schemaLocation KSP arg, fixed two integration issues (missing room imports in ReadCursorDao → KSP MissingType; non-Comparable Pair `<` in keyset test). Room-3-vs-2 decision documented (Room 3 too fresh; revisit point logged).
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **312 tests / 0 failures** across all modules. Two ERROR-008 daemon kills recovered mid-run per documented procedure.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **340 tests / 0 failures**. Three ERROR-008 E:-drive incidents recovered per procedure; pattern worsening — consider hardware-side fix (move caches off removable drive).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -99,7 +99,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Execute Phase P1 — `:core:persistence` (C1.0 research → C1.1 module → C1.2–C1.8 entities/DAOs/SQLCipher/DataStore/pruner/migration tests)** per `docs/core-upgrade-plan.md`. Device backlog below remains open; add: Hilt-graph smoke check on device + UI-040 sound toggle/tone QA.
+**Execute Phase P2 — `:core:security` full stack (C2.0 research → C2.1–C2.8: KeyStore identity keys, self-signed certs, SHA-256 fingerprints, TrustStore v2 + fingerprint pinning, TOFU policy, pairing frames w/ 6-digit code, ECDH→AES-GCM frame E2E)** per `docs/core-upgrade-plan.md`. Device backlog additions: SQLCipher encrypted-open smoke test; Hilt-graph launch check; UI-040 sound toggle/tone QA.
 
 ## DEVICE TESTING BACKLOG (for owner)
 Priority order; each item = install latest debug APK, exercise, report pass/fail:

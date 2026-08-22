@@ -25,6 +25,7 @@ dependencyResolutionManagement {
 rootProject.name = "Flash"
 include(":app")
 include(":core:common")
+include(":core:persistence")
 include(":core:security")
 include(":core:discovery")
 include(":core:network")
