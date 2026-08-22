@@ -1,5 +1,43 @@
 # Error Log
 
+## ERROR-012 - PowerShell 5.1 Get-Content/Set-Content corrupts UTF-8 repo files (mojibake)
+
+### Date
+2026-08-22
+
+### Area
+Tooling / documentation workflow (not app code)
+
+### Symptoms
+After a PowerShell round-trip of `logs/handoff.md`, every em-dash/ellipsis/smart-quote in the file displayed as mojibake (`â€"`, `â€“`, etc.). File content was semantically intact but encoding-damaged across the entire document, including historical sections.
+
+### Environment
+Windows PowerShell 5.1 (default shell), file = UTF-8 without BOM.
+
+### Error
+```text
+`main` â€" remote: ... / UI-025â€"027 ...  (E2 80 94 read as ANSI "â€"", then re-encoded as UTF-8)
+```
+
+### Root cause
+PS 5.1 `Get-Content` without `-Encoding utf8` decodes BOM-less UTF-8 using the legacy ANSI codepage; `Set-Content -Encoding utf8` then re-encodes the already-corrupted strings. One pass destroys all non-ASCII characters.
+
+### Failed attempts
+1. In-place string replacement on the mangled text — abandoned: too many distinct mojibake sequences to reverse reliably.
+
+### Working fix
+`git checkout -- logs/handoff.md` (last commit held a clean copy), then redo all edits with the editor tooling that writes UTF-8 natively.
+
+### Verification
+Post-restore diff clean; subsequent edits verified rendering correctly.
+
+### Related files
+- `logs/handoff.md`
+- Rule going forward: never round-trip repo text files through PS 5.1 Get-/Set-Content; use native edit tools or `-Encoding utf8` on BOTH sides.
+
+### Status
+RESOLVED
+
 ## ERROR-007 - Edge-to-Edge System Bar Overlap (Status Bar Cutout & Navigation Bar)
 
 ### Date
