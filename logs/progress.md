@@ -1,6 +1,30 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 — Phase P2 Executed (:core:security full stack)
+
+### Worked on
+Executed core plan Phase P2 (C2.0–C2.8) via two parallel research-first subagents with strict file ownership (crypto/ vs trust+pairing/); lead wired the :core:persistence dependency into :core:security, ran consolidated builds, fixed seven integration issues.
+
+### Changed
+- **C2.0 research:** AndroidKeyStore ECDSA sign since API 23/StrongBox API 28+; PURPOSE_AGREE_KEY only since API 31 → design decision: identity = Keystore ECDSA P-256, session keys = ephemeral software ECDH P-256 (memory-only); self-signed cert via platform KeyGenParameterSpec certificate fields instead of BouncyCastle (multi-MB dep rejected); HKDF per RFC 5869; AES-GCM random-96-bit-nonce discipline per NIST SP 800-38D.
+- **crypto/ (agent A):** `FlashCrypto` interface, `KeystoreFlashCrypto` (alias flash_identity, StrongBox→TEE fallback, platform self-signed cert retrieval), `SoftwareFlashCrypto` (JVM tests/fallback, loud NOT-FOR-PRODUCTION), `Hkdf` (RFC 5869 test cases 1–2 as vectors), `FlashFingerprint` (SHA-256 D3 + hex-group formatting + constant-time equals), `E2eFrameCodec` ([12B nonce|ct+tag], AAD=protocol version, AES-256-GCM).
+- **trust/pairing/ (agent B):** `RoomTrustedStore` (additive FlashTrustStore impl + pin/isPinned/trustedPeers Flow + idempotent legacy import w/ LEGACY_UNBOUND_FINGERPRINT so old flags never silently become pins), pure `TofuPolicy` (FirstConnect/Match/Mismatch, fail-closed incl. missing presented fingerprint), `FlashPairingFrames`, symmetric `NumericComparisonCode` (sorted-concat SHA-256, BT-SSP numeric-comparison precedent), pure `PairingSessionStateMachine` (8 phases, engine-owned timeouts, Expired≠Failed, mapped to UI-032 demo phases), `DefaultFlashPairingProtocol` orchestrator (events flow, onFrame/onTick seams for C4/C6).
+- **docs/security.md created:** threat model, identity/pairing/E2E policy, nonce discipline, rekey deferral to D5 mesh workstream, known gaps.
+- **Lead integration fixes (7):** missing KeyPairGenerator import; generateKeyPair name collision inside .run block; kotlinx Flow.map vs FlashResult.map overload collision in RoomTrustedStore → try/catch rewrite; TofuPolicy nullable-arg type mismatch; PeerDeclined reducer violating its own total-reducer principle (only meaningful in AwaitingPeerConfirmation); replay=0 SharedFlow needed testScheduler.runCurrent() pumping in 3 tests; PAIR_CONFIRM fed to wrong party in handshake test.
+
+### Verification
+- Consolidated `testDebugUnitTest assembleDebug`: **BUILD SUCCESSFUL, 413 tests / 0 failures** (+73: RFC vectors, ECDH bidirectional agreement, tamper detection, numeric-code symmetry/determinism, state-machine transition matrix incl. expiry boundaries, two-party cross-wired handshake, TOFU decisions incl. blank-presented fail-closed, migration idempotency).
+- Recurrent Kotlin-daemon crashes from E:-drive I/O drops (ERROR-008) — recovered each run. **Incident note:** one PowerShell Get-Content/Set-Content pass corrupted handoff.md UTF-8 (mojibake); restored from git commit and redid edits via UTF-8-safe tools. Lesson recorded: never round-trip repo text files through PS 5.1 Get-/Set-Content.
+- Runtime Keystore/E2E verification pending (device backlog item added).
+
+### Remaining
+- Phase P3 next (discovery continuous mode C3.1–C3.5 + device battery C3.11).
+- Wire pairing protocol to transport when C4 lands; decline frame encoding C4/C6.
+
+### Next AI
+Start P3 per plan §5. R1 research-first every step. Beware ERROR-008; commit incrementally.
+
 ## 2026-08-22 — Phase P1 Executed (:core:persistence — Room + SQLCipher + DataStore)
 
 ### Worked on
@@ -1922,3 +1946,69 @@ Created full premium chat UI implementation specification from owner prompt. Upd
 
 ### Next AI
 Follow AGENTS.md §34: begin UI-001 research only. Do not implement chat UI until `design-system.md` is DESIGNED.
+
+## 2026-08-22 — Phase P2 partial: C2.1–C2.3 + C2.7 + C2.8 crypto core (:core:security/crypto)
+
+### Worked on
+Implemented the crypto foundation of C2 (steps C2.1 identity key, C2.2 self-signed cert, C2.3 fingerprint, C2.7 E2E frames, C2.8 constant-time compares + RFC vectors) with mandatory R1 research first. Trust (C2.4/C2.5) and pairing (C2.6) packages are owned by a concurrent agent and were NOT touched.
+
+### Changed
+All new files under core/security/.../crypto/ only:
+- Hkdf.kt — RFC 5869 HKDF-SHA256 extract/expand/derive (internal).
+- FlashCrypto.kt — interface (identityPublicKey exposure, sign, wire-friendly ByteArray verify, ephemeral ECDH keygen, ecdhSessionKey → 32-byte AES-256 via HKDF bound to FlashProtocol.VERSION) + shared pure-JCA ops (EcP256Ops).
+- KeystoreFlashCrypto.kt — AndroidKeyStore ECDSA P-256 alias lash_identity (SIGN|VERIFY, SHA-256 digest, StrongBox on API 28+ with fallback, biometric-invalidation off); selfSignedCertificate() uses the PLATFORM-generated keystore cert (AOSP AndroidKeyStoreKeyPairGeneratorSpi) — no BouncyCastle, no hand-rolled DER.
+- SoftwareFlashCrypto.kt — JVM-test/fallback impl, loud NOT-FOR-PRODUCTION KDoc.
+- FlashFingerprint.kt — SHA-256 fingerprint, stable XX:XX uppercase grouping, constantTimeEquals via MessageDigest.isEqual.
+- E2eFrameCodec.kt — AES-256-GCM [12B nonce | ct+tag], AAD = protocol version string; nonce discipline + rekey placeholder documented.
+- Tests: HkdfTest (RFC 5869 TC1+TC2 exact OKM/PRK), SoftwareFlashCryptoTest (sign/verify roundtrip+tamper, ECDH both-direction equality), E2eFrameCodecTest (roundtrip, wrong-key/tamper ⇒ AEADBadTagException), FlashFingerprintTest (hard-coded vector 82A67EF3…F4EB computed independently).
+
+### Verification
+- NOT yet built: Gradle runs are forbidden for this agent per task constraints (one consolidated run happens at session consolidation). All test vectors taken from authoritative sources; fingerprint vector independently precomputed.
+- Next consolidating agent MUST run :core:security:testDebugUnitTest and record results here.
+
+### Remaining
+- C2.4–C2.6 (trust store extension, TOFU, pairing frames) — concurrent agent.
+- docs/security.md threat-model update (C2.8 tail) once both agents' work merges.
+- Device verification of KeystoreFlashCrypto (StrongBox path, cert generation) — JVM-only here.
+
+### Next AI
+Run the consolidated unit-test build; if AEAD/HKDF vectors fail, check Hkdf.expand counter byte first.
+
+## 2026-08-22 " Phase P2 executed: C2.4"C2.6 (Trust pinning + TOFU + Pairing) via subagent
+
+### Worked on
+Implemented C2.4 (Room-backed trust/pin store), C2.5 (TOFU policy), C2.6 (pairing frames, numeric-comparison code, pairing state machine, pairing protocol orchestrator) in `:core:security`, per `docs/core-upgrade-plan.md` C2 with R1 research-first and strict file ownership (trust/** new files only, pairing/**, tests; crypto/** untouched " concurrent agent owns it; no .gradle/.toml edits; Gradle NOT run per instructions).
+
+### R1 Research citations
+- Numeric comparison precedent (Bluetooth): Bluetooth Core spec, Security Manager " LE Secure Connections numeric comparison value generation function g2 " both devices compute 6-digit values from BOTH parties' public data so displays match; user compares; mismatch aborts: https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core_v6.3/out/en/host/security-manager-specification.html ; walkthrough: https://www.bluetooth.com/blog/bluetooth-pairing-part-4/ ; formal analysis of comparison-based key exchange: https://eprint.iacr.org/2009/013.pdf . Applied: SHA-256 over lexicographically SORTED fingerprint pair (role-independent symmetry), first 5 bytes big-endian mod 10^6, %06d.
+- TOFU pitfalls: OWASP Pinning Cheat Sheet " pin SPKI/public key NOT leaf cert chain (survives rotation), fail closed on pin failure, users click past warnings so NO bypass: https://cheatsheetseries.owasp.org/cheatsheets/Pinning_Cheat_Sheet.html ; RFC 7469 " pins are public-key relationships; TOFU residual risk = MITM on first connection; pin validation failure is non-recoverable: https://datatracker.ietf.org/doc/html/rfc7469 . Applied: TofuPolicy pins identity-key fingerprints (C2.3), FirstConnect prompt covers the first-connection risk (mitigated out-of-band by the 6-digit code), Mismatch = hard fail with UI-031 event data, blank presented fingerprint fails closed.
+- Room DAO injection pattern: Android data-layer guide " inject DAO into repository-ish store via constructor, suspend one-shots + Flow observables, don't create internal scopes: https://developer.android.com/topic/architecture/data-layer ; async DAO queries (suspend/Flow): https://developer.android.com/training/data-storage/room/async-queries .
+
+### Changed
+- `core/security/src/main/java/.../security/trust/pinned/RoomTrustedStore.kt` " implements FlashTrustStore ADDITIVELY (R4; sync methods = runBlocking bridge, documented deprecated-by-convention) + new suspend `pin/isPinned/revoke`, `trustedPeers(): Flow<List<FlashTrustedPeer>>`, idempotent `importFrom(preferencesStore)` migration. Thin DAO delegations; no internal scope.
+- `trust/pinned/TofuPolicy.kt` " pure Decision sealed {FirstConnect(promptData), Match, Mismatch(KEY_CHANGED|PRESENTED_FINGERPRINT_MISSING)}; constant-time compare via MessageDigest.isEqual; legacy blank-fingerprint rows re-prompt instead of trusting silently.
+- `trust/pinned/LegacyTrustMigration.kt` " pure merge logic for SharedPreferences"Room migration (existing rows win " idempotent; legacy rows carry unbound sentinel).
+- `pairing/FlashPairingFrames.kt` " sealed FlashPairingFrame {PairRequest, PairAccept, PairConfirm(codeHashHex), Paired}; plain Kotlin types, wire encoding deferred C4/C6 (noted in KDoc).
+- `pairing/NumericComparisonCode.kt` " derive() (sorted-concat SHA-256 construction documented incl. why sorted), confirmationHashHex(), hashesEqual() constant-time, normalizeHex().
+- `pairing/PairingSessionStateMachine.kt` " 8 phases mapped to profile-ui.md FlashPairingPhase in KDoc; pure reduce(state,event,timeouts,localFp); PairingTimeouts(requestExpiryMs=30s default, decisionWindowMs configurable); Expired is neutral (â‰  Failed); inapplicable events are no-ops.
+- `pairing/FlashPairingProtocol.kt` " FlashPairingEvent sealed (RequestReceived w/ code6+expiresAtMs, PeerAccepted, PeerDeclined, Expired, Confirmed(fp+ephemeralPubKey), Failed); FlashPairingProtocol interface per plan target abstraction + additive onFrame/onTick integration seams; DefaultFlashPairingProtocol fully fake-constructible (no Android types, no internal scope/clock " engine drives ticks).
+- Tests (JVM-only, no Robolectric needed): `pairing/NumericComparisonCodeTest` (determinism, symmetry, format/range, uniformity sanity over seeded 5k samples, hash checks), `pairing/PairingSessionStateMachineTest` (full transition matrix incl. expiry boundary, decision-window expiry, code-hash mismatch, terminal absorption, stale-requestId ignore), `pairing/DefaultFlashPairingProtocolTest` (two-party cross-wired handshake happy path, tampered confirm hard-fail, expiry, busy-beginRequest, decline, accept-without-request), `trust/TofuPolicyTest`, `trust/LegacyTrustMigrationTest`; local `testutil/FakeClock` (module-local copy ":core:common FakeTimeSource not visible across modules).
+
+### Verification
+- NOT run yet: Gradle execution was explicitly forbidden this session ("DO NOT run Gradle"). Code is written to compile against declared module deps (:core:common, :core:persistence, room-runtime, junit, kotlinx-coroutines-test " verified by reading core/security/build.gradle.kts). Existing trust/identity files untouched (R4); existing tests unaffected.
+- RoomTrustedStore itself has no unit tests BY DESIGN (per task instruction): it is one-line DAO delegation; DAO semantics covered by :core:persistence invariant suite (P1). Depth placed in machine/code/TOFU/migration-merge tests.
+
+### Problems
+- Initial reducer draft used an exception-based "ignore" helper " rewrote as total pure function returning unchanged state (no exceptions escape).
+- sendFrame sink initially typed `suspend` but beginRequest() is non-suspend (plan signature) " changed sink to synchronous enqueue-style `(FlashPairingFrame)->Unit` (documented: non-blocking/enqueue-only; socket I/O stays in transport queue C4/C6).
+- SharedFlow(replay=0) drops emissions before collectors subscribe " protocol tests use CoroutineStart.UNDISPATCHED collectors.
+- PAIR_DECLINE frame does not exist in the C2 frame set (plan lists exactly REQUEST/ACCEPT/CONFIRM/PAIRED): respondDecline() resets locally; wire-level peer-decline notification deferred to C4/C6 encoding (documented in KDoc). Machine already supports PeerDeclined " DeclinedByPeer.
+
+### Remaining
+- Wire codec for FlashPairingFrame (C4/C6).
+- Real key material from concurrent crypto agent (FlashCrypto) " ephemeralPublicKeyProvider currently injected seam.
+- Engine wiring: ticker scheduling, TOFU pin persistence on Confirmed events (C7), autoAcceptTrusted setting hookup.
+- Physical-device verification of full handshake once C4 TLS lands.
+
+### Next AI
+1) Run consolidated testDebugUnitTest (agents normally run one Gradle pass per session " this session was blocked from doing so); expect +~30 tests. 2) Fix anything red, log errors per ERROR-0XX. 3) Coordinate with crypto agent for FlashCrypto injection into ephemeralPublicKeyProvider. 4) Update handoff.md.

@@ -4,10 +4,10 @@
 `main` — remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
 
 ## Last verified build
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 374 Gradle tasks, **340 tests / 0 failures**.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **413 tests / 0 failures**.
 
 ## Current phase
-**Phase P1 COMPLETE (2026-08-22): :core:persistence landed — Room 2.8.4 (11 entities + 11 DAOs, keyset pagination, IGNORE/upsert semantics), SQLCipher 4.18.0 encrypted opener w/ PassphraseProvider seam, FlashSettingsDataStore (9 keys incl. soundsEnabled default-off), RetentionPolicy + PrunableSource seam, schema v1 exported in-repo, invariant tests green (dedup / outbox-race / cursor-monotonicity / keyset-walk / chunk-bitvector). P0 (C0 foundations + Hilt + CI + UI-040 sounds) done earlier same day; 340 tests total. Next: Phase P2 (:core:security C2.0–C2.8). All UI IDs IMPLEMENTED except UI-045 quality gate (after device verification).**
+**Phase P2 COMPLETE (2026-08-22): :core:security full stack landed — crypto/ (Keystore ECDSA P-256 identity w/ StrongBox fallback, ephemeral-software ECDH P-256 → HKDF-SHA256 → AES-256-GCM frame codec w/ RFC 5869 test vectors, SHA-256 fingerprints + constant-time compares, platform-generated self-signed cert — no BouncyCastle), trust/pinned/ (RoomTrustedStore fingerprint pinning + idempotent legacy migration, pure TofuPolicy fail-closed), pairing/ (frames, symmetric 6-digit numeric-comparison code per BT-SSP precedent, pure timeout-aware state machine mapped to UI-032 phases, DefaultFlashPairingProtocol orchestrator). Keystore/E2E-on-device runtime verification pending (JVM tests use SoftwareFlashCrypto). P0+P1 done earlier same day. Next: Phase P3 (C3 discovery continuous mode). All UI IDs IMPLEMENTED except UI-045 gate.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -71,10 +71,10 @@
 - None.
 
 ## Last change
-Phase P1 executed: :core:persistence created (Room 2.8.4 + SQLCipher 4.18.0 + DataStore). Two research-first subagents (db entities/DAOs/opener/invariants; settings/retention) under strict file ownership; lead scaffolded build config, added room.schemaLocation KSP arg, fixed two integration issues (missing room imports in ReadCursorDao → KSP MissingType; non-Comparable Pair `<` in keyset test). Room-3-vs-2 decision documented (Room 3 too fresh; revisit point logged).
+Phase P2 executed: :core:security crypto primitives (KeystoreFlashCrypto / SoftwareFlashCrypto / Hkdf / E2eFrameCodec / FlashFingerprint), Room-backed pinned trust store + TOFU policy + legacy migration, pairing frames + numeric-comparison 6-digit code + pure state machine + protocol orchestrator. Lead integration fixes: missing KeyPairGenerator import + generateKeyPair name collision; Flow.map vs FlashResult.map overload collision in RoomTrustedStore (rewrote as try/catch); TofuPolicy nullable-arg mismatch; PeerDeclined reducer contradiction w/ its own total-reducer principle; test-dispatcher pumping for replay=0 SharedFlow collectors; PAIR_CONFIRM direction fix in the handshake test.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **340 tests / 0 failures**. Three ERROR-008 E:-drive incidents recovered per procedure; pattern worsening — consider hardware-side fix (move caches off removable drive).
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **413 tests / 0 failures** (+73). Recurrent Kotlin-daemon crashes from E:-drive I/O drops persist (recovered each time via --stop / fresh daemon).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -99,7 +99,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Execute Phase P2 — `:core:security` full stack (C2.0 research → C2.1–C2.8: KeyStore identity keys, self-signed certs, SHA-256 fingerprints, TrustStore v2 + fingerprint pinning, TOFU policy, pairing frames w/ 6-digit code, ECDH→AES-GCM frame E2E)** per `docs/core-upgrade-plan.md`. Device backlog additions: SQLCipher encrypted-open smoke test; Hilt-graph launch check; UI-040 sound toggle/tone QA.
+**Execute Phase P3 — Discovery continuous mode (C3.0 research → C3.1–C3.5: FlashRadioTransport seam, identity-aware TXT advertising, continuous browsing w/ auto-restart + lost-peer aging sweeper, API-34+ registerServiceInfoCallback resolution split, NetworkRequest-scoped discovery)** per `docs/core-upgrade-plan.md`, then two-phone device battery (C3.11). Device backlog additions: SQLCipher encrypted-open smoke; Hilt-graph launch check; UI-040 sound toggle QA; Keystore identity-key generation on device.
 
 ## DEVICE TESTING BACKLOG (for owner)
 Priority order; each item = install latest debug APK, exercise, report pass/fail:

@@ -51,6 +51,9 @@ publishing {
 
 dependencies {
     implementation(project(":core:common"))
+    implementation(project(":core:persistence"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.room.runtime)
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
