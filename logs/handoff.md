@@ -7,7 +7,7 @@
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-21); 357 Gradle tasks, all unit tests green.
 
 ## Current phase
-**ALL UI-001–045 IDs IMPLEMENTED (except UI-040 BLOCKED on owner sound decision; UI-045 quality gate intentionally last). Critical path = device verification backlog.**
+**ALL UI-001–045 IDs IMPLEMENTED (except UI-040 BLOCKED on owner sound decision; UI-045 quality gate intentionally last). Four provisional demo pages REMOVED (icon/motion QA sheets, experimental WS transfer, LAN demo home). Core upgrade plan split: PART 1 = `docs/core-upgrade-plan.md` (core components), PART 2 = `docs/ui-page-plan.md` (pages & bottom nav). Critical path = device verification backlog + owner sign-off on plan decisions D1–D6.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -80,7 +80,16 @@ Final parallel round: UI-034 (adaptive window classes + two-pane helper), UI-038
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
 
 ## Deferred / pending integration (do not forget)
-**Master upgrade plan: `docs/core-upgrade-plan.md` (PROPOSED — awaiting owner sign-off on decisions D1–D6). Covers core upgrades (Phases 0–8), frontend API exposure via `FlashEngine`, bottom-nav recommendation (Chats/Transfers/Nearby/Settings + Send FAB), and feature backlog F01–F30. All items below are absorbed into that plan.**
+**Master plans (PROPOSED, awaiting owner sign-off on D1–D6 in PART 1):**
+- **PART 1 — Core:** `docs/core-upgrade-plan.md` — per-component upgrades (C0 foundations → C7 engine facade), abstraction→implementation→exposure per module.
+- **PART 2 — Pages:** `docs/ui-page-plan.md` — bottom nav shell (Chats/Transfers/Nearby/Settings + Send FAB), page-by-page specs P1–P5 with core-API dependencies, integration checklist.
+
+All items below are absorbed into those two documents:
+- UI-031 badge/sheet wiring into header; `isVerified` passes false until pairing lands.
+- UI-032 pairing dialog trigger from discovery flow; Accept/Decline need engine callbacks.
+- UI-024 recent-searches persistence; UI-029 demo roster until live members.
+- UI-020 MediaRecorder capture ADR; UI-019 Media3 playback ADR.
+- Engine-side auto-retry/backoff indicator (UI-044); key-changed warning state (UI-031).
 - **UI-031**: wire `FlashEncryptionBadge` near conversation header; tap opens `FlashEncryptionSheet`. `isVerified` passes `false` until pairing/engine lands; verification rows disabled-with-explanation.
 - **UI-032**: trigger `FlashPairingDialog` from the Nearby Devices/discovery flow once engine exposes pairing events; Accept/Decline need engine callbacks.
 - **UI-024**: recent-searches persistence (currently in-memory only).

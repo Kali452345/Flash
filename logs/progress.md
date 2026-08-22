@@ -1,6 +1,27 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 - Demo Pages Removed + Plan Split into Core/Pages Parts
+
+### Worked on
+Per owner decision: removed the four provisional demo pages, and restructured core-upgrade-plan.md into two dedicated plan documents.
+
+### Removed (git history preserves everything)
+1. Icon QA sheet (FlashIconSheet.kt, :ui:theme/icons)
+2. Motion QA sheet (FlashMotionSheet.kt, :ui:theme)
+3. Experimental WS transfer page (:ui:transfer module deleted - WsTransferScreen/WsFileActions/test; module removed from settings.gradle.kts and app dependencies)
+4. LAN discovery demo home (FlashHomeScreen + helpers in MainActivity)
+
+Engine classes (LanController, WsTransferManager, WsDiscovery, WsPairingStore, AppIdentity) remain in :app as relocation sources for core Phase C4/C5. MainActivity rewritten as a minimal ChatList-Conversation shell until bottom navigation lands.
+
+### Changed
+- docs/core-upgrade-plan.md is now **PART 1: Core Components** only - reorganized per-component (C0 Foundations, C1 Persistence, C2 Security, C3 Discovery, C4 Network, C5 Transfer, C6 Messaging, C7 Engine facade), each with Current state / Target abstraction / Implementation steps / Frontend exposure.
+- docs/ui-page-plan.md is NEW **PART 2: Pages & Navigation** - app shell (bottom nav Chats/Transfers/Nearby/Settings + Send FAB), page specs P1-P5 with core-API dependencies and states, overlay inventory, integration checklist.
+- Handoff updated to reference both parts; Deferred block points at the split plans.
+
+### Verification
+- assembleDebug - BUILD SUCCESSFUL after one ERROR-008 daemon recovery cycle.
+
 ## 2026-08-22 — Core Upgrade & API Exposure Plan (research + planning only)
 
 ### Worked on
