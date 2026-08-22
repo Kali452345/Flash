@@ -1,6 +1,41 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 — Core Upgrade & API Exposure Plan (research + planning only)
+
+### Worked on
+Surveyed all six `:core:*` modules (public APIs + gaps), performed extensive online research, and authored **`docs/core-upgrade-plan.md`** (PROPOSED — no code implemented per owner instruction).
+
+### Research performed (online)
+- LocalSend protocol v2 (receiver-runs-HTTP model, PIN verify, reverse browser transfer, multi-recipient) + Quick Share benchmarks (LAN ≫ Wi-Fi Direct throughput).
+- Knit / bitchat-android / AirChat mesh messengers (dual-radio transport seams, signed relay frames w/ TTL dedup, store-and-forward, battery tiers, Noise/P-256 E2E patterns, offline APK self-share).
+- mftp + Swoosh + gusset transfer engineering (chunk bit-vector resume, BLAKE3/SHA-256 integrity, adaptive chunking, zstd, TOFU pinning, AAD-bound ciphertexts).
+- Stream offline-sync + chat architecture articles and Android offline-first guide (Room source-of-truth, outbox+WorkManager backoff/jitter, pull-delta-before-replay, receipt batching, tombstones).
+
+### Created
+- `docs/core-upgrade-plan.md`: current-state inventory per module; target architecture (`FlashEngine` facade over Room-backed repositories); **9 phases / ~64 numbered steps** (foundations → persistence → real messaging engine → transfer v2 → security/TLS/TOFU/pairing → discovery expansion (Aware/Direct/BLE seam) → background runtime → frontend API exposure → hardening); bottom-navigation recommendation (**Chats / Transfers / Nearby / Settings** + Send FAB); feature backlog **F01–F30** with sources; decisions D1–D6 requiring owner input (DI framework, at-rest encryption, hash lib, frame E2E, mesh scope, sound/UI-040).
+
+### Not done
+- No implementation (owner: "don't implement anything").
+
+---
+
+## 2026-08-22 — Git repository enabled + initial push to GitHub
+
+### Worked on
+Enabled version control for the project (previously un-managed per earlier handoffs).
+
+### Changed
+- Extended `.gitignore`: module `build/` dirs, `.gradle-user-home/`, `.kotlin/`, `.idea/`, `*.log` build-noise files, `local.properties`.
+- `git init -b main` → remote `origin = https://github.com/Kali452345/Flash.git`.
+- Initial commit `8a5c458` — 330 files / ~40k lines (all source, docs, logs; zero build artifacts verified pre-commit).
+- Pushed to `origin/main`.
+
+### Note
+Git identity set repo-locally (Kali452345 / noreply email) — adjust if a different identity is wanted.
+
+---
+
 ## 2026-08-22 - Final Parallel Round: UI-034/038/039/041/042/043 - IMPLEMENTED
 
 ### Worked on

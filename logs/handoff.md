@@ -1,7 +1,7 @@
 # Current Handoff
 
 ## Current branch
-Unavailable. `E:\Flash` is not a Git repository.
+`main` — remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
 
 ## Last verified build
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-21); 357 Gradle tasks, all unit tests green.
@@ -80,6 +80,7 @@ Final parallel round: UI-034 (adaptive window classes + two-pane helper), UI-038
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
 
 ## Deferred / pending integration (do not forget)
+**Master upgrade plan: `docs/core-upgrade-plan.md` (PROPOSED — awaiting owner sign-off on decisions D1–D6). Covers core upgrades (Phases 0–8), frontend API exposure via `FlashEngine`, bottom-nav recommendation (Chats/Transfers/Nearby/Settings + Send FAB), and feature backlog F01–F30. All items below are absorbed into that plan.**
 - **UI-031**: wire `FlashEncryptionBadge` near conversation header; tap opens `FlashEncryptionSheet`. `isVerified` passes `false` until pairing/engine lands; verification rows disabled-with-explanation.
 - **UI-032**: trigger `FlashPairingDialog` from the Nearby Devices/discovery flow once engine exposes pairing events; Accept/Decline need engine callbacks.
 - **UI-024**: recent-searches persistence (currently in-memory only).
