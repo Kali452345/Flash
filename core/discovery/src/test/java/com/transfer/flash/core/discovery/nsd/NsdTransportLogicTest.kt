@@ -1,0 +1,442 @@
+package com.transfer.flash.core.discovery.nsd
+
+import com.transfer.flash.core.common.model.FlashDeviceId
+import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
+import com.transfer.flash.core.discovery.core.EndpointDirectory
+import com.transfer.flash.core.discovery.core.FlashAdvertisedIdentity
+import com.transfer.flash.core.discovery.core.FlashTransportEvent
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * JVM tests for [NsdTransport]'s extracted logic + bridge-driven event mapping
+ * (plan C3.2–C3.4). No Robolectric / no kotlinx-coroutines-test: the module's test
+ * classpath has neither, so virtual time is replaced by an injected no-op `sleep`
+ * and a manual timestamp clock (documented deviation — gradle is read-only).
+ */
+class NsdTransportLogicTest {
+
+    // ------------------------------------------------------------------
+    // Fakes
+    // ------------------------------------------------------------------
+
+    private class FakeApiLevel(override val sdkInt: Int) : NsdApiLevel
+
+    private fun identity(
+        id: String = "peer-1",
+        name: String = "Pixel A",
+        model: String = "Pixel 7",
+        proto: Int = 2,
+    ) = FlashAdvertisedIdentity(FlashDeviceId(id), name, model, proto)
+
+    private fun resolvedData(
+        serviceName: String = "Flash Peer",
+        deviceId: String? = "peer-1",
+        host: String? = "192.168.1.50",
+        port: Int = 45821,
+        proto: String = "2",
+    ) = ResolvedServiceData(
+        hostAddress = host,
+        port = port,
+        serviceName = serviceName,
+        attributes = buildMap {
+            if (deviceId != null) put(NsdTxtCodec.KEY_DEVICE_ID, deviceId)
+            put(NsdTxtCodec.KEY_NAME, "Peer Name")
+            put(NsdTxtCodec.KEY_MODEL, "Model X")
+            put(NsdTxtCodec.KEY_PROTO, proto)
+        },
+    )
+
+    /** EndpointDirectory fake driven by a queue of canned diffs (task-sanctioned inline impl). */
+    private class FakeDirectory : EndpointDirectory {
+        val seenCalls = mutableListOf<Pair<FlashDiscoveredEndpoint, Long>>()
+        val lostCalls = mutableListOf<FlashDeviceId>()
+        val seenResults = ArrayDeque<EndpointDirectory.Diff>()
+        var lostResult: EndpointDirectory.Diff = EndpointDirectory.Diff.Unchanged
+
+        override fun applySeen(endpoint: FlashDiscoveredEndpoint, nowMs: Long): EndpointDirectory.Diff {
+            seenCalls += endpoint to nowMs
+            return if (seenResults.isEmpty()) EndpointDirectory.Diff.Unchanged else seenResults.removeFirst()
+        }
+
+        override fun applyLost(deviceId: FlashDeviceId): EndpointDirectory.Diff {
+            lostCalls += deviceId
+            return lostResult
+        }
+
+        override fun sweepExpired(graceWindowMs: Long, nowMs: Long): List<EndpointDirectory.Diff.Lost> = emptyList()
+
+        override fun snapshot(): List<EndpointDirectory.Entry> = emptyList()
+
+        override fun get(deviceId: FlashDeviceId): EndpointDirectory.Entry? = null
+    }
+
+    @Suppress("FunctionName")
+    private fun DiffFound(endpoint: FlashDiscoveredEndpoint) =
+        EndpointDirectory.Diff.Found(
+            EndpointDirectory.Entry(endpoint, firstSeenAtMs = 0L, lastSeenAtMs = 0L),
+        )
+
+    @Suppress("FunctionName")
+    private fun DiffLost(id: String) = EndpointDirectory.Diff.Lost(FlashDeviceId(id))
+
+    private class FakeBridge : NsdManagerBridge {
+        val lockStates = mutableListOf<Boolean>()
+        val advertiseRequests = mutableListOf<AdvertiseRequest>()
+        val browseRequests = mutableListOf<BrowseRequest>()
+        val monitorRequests = mutableListOf<MonitorRequest>()
+        var startBrowseResult = true
+        var advertiseResult = true
+        var monitorResult = true
+        var stopBrowseCalled = false
+        var monitorsCancelled = false
+        var unadvertiseCalled = false
+
+        lateinit var browseEvents: BrowseEvents
+            private set
+        lateinit var monitorEvents: MonitorEvents
+            private set
+
+        override fun setMulticastLock(active: Boolean) {
+            lockStates += active
+        }
+
+        override fun advertise(request: AdvertiseRequest, events: AdvertiseEvents): Boolean {
+            advertiseRequests += request
+            events.onRegistered(request.serviceName, request.port)
+            return advertiseResult
+        }
+
+        override fun unadvertise(events: AdvertiseEvents) {
+            unadvertiseCalled = true
+        }
+
+        override fun startBrowse(request: BrowseRequest, events: BrowseEvents): Boolean {
+            browseRequests += request
+            browseEvents = events
+            return startBrowseResult
+        }
+
+        override fun stopBrowse() {
+            stopBrowseCalled = true
+        }
+
+        override fun monitor(request: MonitorRequest, events: MonitorEvents): Boolean {
+            monitorRequests += request
+            monitorEvents = events
+            return monitorResult
+        }
+
+        override fun cancelMonitors() {
+            monitorsCancelled = true
+        }
+
+        fun fireBrowseStartFailed(errorCode: Int) = browseEvents.onStartFailed(errorCode)
+        fun fireServiceFound(name: String) = browseEvents.onServiceFound(name)
+        fun fireMonitorUpdated(data: ResolvedServiceData) = monitorEvents.onUpdated(data)
+        fun fireMonitorLost(name: String) = monitorEvents.onMonitorLost(name)
+    }
+
+    /** Collects transport events synchronously; handlers run inline on Dispatchers.Unconfined. */
+    private class EventRecorder(transport: NsdTransport) {
+        val received = mutableListOf<FlashTransportEvent>()
+        private val job: Job = CoroutineScope(Dispatchers.Unconfined + Job()).launch(
+            start = CoroutineStart.UNDISPATCHED,
+        ) {
+            transport.events.collect { received += it }
+        }
+
+        fun cancel() = job.cancel()
+    }
+
+    private fun newTransport(
+        apiLevel: Int,
+        directory: FakeDirectory,
+        bridge: FakeBridge,
+        maxRestarts: Int = 5,
+        delays: MutableList<Long>? = null,
+    ): NsdTransport {
+        val recordedDelays = delays
+        return NsdTransport(
+            context = null,
+            apiLevel = FakeApiLevel(apiLevel),
+            directory = directory,
+            sweep = { _ -> emptyList() },
+            retryDelayMs = { attempt ->
+                (1000L * attempt).also { recordedDelays?.add(it) }
+            },
+            maxBrowsingRestarts = maxRestarts,
+            dispatcher = Dispatchers.Unconfined,
+            timeSourceMs = { 1_000L },
+            sleep = { /* no-op: deterministic, no virtual time needed */ },
+            logInfo = {},
+            logWarn = {},
+            bridgeOverride = bridge,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // TXT codec
+    // ------------------------------------------------------------------
+
+    @Test
+    fun txtCodec_encode_containsIdentityKeySet() {
+        val txt = NsdTxtCodec.encode(identity())
+        assertEquals("peer-1", txt[NsdTxtCodec.KEY_DEVICE_ID])
+        assertEquals("Pixel A", txt[NsdTxtCodec.KEY_NAME])
+        assertEquals("Pixel 7", txt[NsdTxtCodec.KEY_MODEL])
+        assertEquals("2", txt[NsdTxtCodec.KEY_PROTO])
+    }
+
+    @Test
+    fun txtCodec_decode_fallsBackGracefully() {
+        val parsed = NsdTxtCodec.decode(mapOf(NsdTxtCodec.KEY_PROTO to "9"), fallbackName = "svc", fallbackProto = 2)
+        assertNull(parsed.deviceId)
+        assertEquals("svc", parsed.friendlyName)
+        assertEquals(9, parsed.protocolVersion)
+
+        val defaulted = NsdTxtCodec.decode(emptyMap(), fallbackName = "svc", fallbackProto = 2)
+        assertEquals("svc", defaulted.friendlyName)
+        assertEquals(2, defaulted.protocolVersion)
+    }
+
+    @Test
+    fun restartPolicy_capsAndGivesUp() {
+        assertEquals(1_000L, NsdRestartPolicy.computeRestart(1, 5) { 1_000L }.delayMs)
+        assertNull(NsdRestartPolicy.computeRestart(6, 5) { 1_000L }.delayMs)
+        assertTrue(NsdRestartPolicy.exponentialBackoff(10) <= 30_000L)
+    }
+
+    // ------------------------------------------------------------------
+    // Advertising + self-filter (C3.2)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun startAdvertising_sendsIdentityTxtRecords() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge)
+
+        runBlocking {
+            val result = transport.startAdvertising(45821, identity(id = "self-1", name = "My Phone"))
+            assertTrue(result.isSuccess)
+        }
+
+        val request = bridge.advertiseRequests.single()
+        assertEquals("_flash-transfer._tcp.", request.serviceType)
+        assertEquals(45821, request.port)
+        assertEquals("self-1", request.txtRecords[NsdTxtCodec.KEY_DEVICE_ID])
+        assertEquals("2", request.txtRecords[NsdTxtCodec.KEY_PROTO])
+        assertTrue(request.serviceName.startsWith("Flash"))
+    }
+
+    @Test
+    fun resolvedEvent_matchingOwnDeviceId_isFilteredBeforeDirectory() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startAdvertising(45821, identity(id = "self-1")) }
+        runBlocking { transport.startBrowsing() }
+        val recorder = EventRecorder(transport)
+
+        bridge.fireServiceFound("Flash My Phone")
+        bridge.fireMonitorUpdated(resolvedData(deviceId = "self-1"))
+
+        assertTrue(directory.seenCalls.isEmpty())
+        assertFalse(recorder.received.any { it is FlashTransportEvent.Found || it is FlashTransportEvent.Updated })
+        recorder.cancel()
+    }
+
+    // ------------------------------------------------------------------
+    // Found-once-then-updated mapping (C3.3/C3.4)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun serviceUpdate_mapsToFoundThenUpdatedThroughDirectory() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+        val recorder = EventRecorder(transport)
+
+        val endpoint = FlashDiscoveredEndpoint(
+            device = com.transfer.flash.core.common.model.FlashDevice(
+                FlashDeviceId("peer-1"),
+                "Peer Name",
+                com.transfer.flash.core.common.model.FlashTransportType.LAN,
+            ),
+            hostAddress = "192.168.1.50",
+            port = 45821,
+            serviceName = "Flash Peer",
+        )
+        directory.seenResults.addLast(DiffFound(endpoint))
+        bridge.fireServiceFound("Flash Peer")
+        bridge.fireMonitorUpdated(resolvedData())
+
+        // Second update → Updated diff. The entry must carry the NEW endpoint data
+        // (production StandardEndpointDirectory stores the fresh sighting); the diff
+        // kind only decides Found vs Updated emission.
+        val updatedEndpoint = endpoint.copy(hostAddress = "192.168.1.51")
+        directory.seenResults.addLast(
+            EndpointDirectory.Diff.Updated(
+                EndpointDirectory.Entry(updatedEndpoint, 0L, 5_000L),
+                EndpointDirectory.Entry(endpoint, 0L, 1_000L),
+            ),
+        )
+        bridge.fireMonitorUpdated(resolvedData(host = "192.168.1.51"))
+
+        val found = recorder.received.filterIsInstance<FlashTransportEvent.Found>()
+        val updated = recorder.received.filterIsInstance<FlashTransportEvent.Updated>()
+        assertEquals(1, found.size)
+        assertEquals("192.168.1.50", found.single().endpoint.hostAddress)
+        assertEquals(1, updated.size)
+        assertEquals("192.168.1.51", updated.single().endpoint.hostAddress)
+        assertEquals(2, directory.seenCalls.size)
+        assertEquals(1_000L, directory.seenCalls[0].second)
+        recorder.cancel()
+    }
+
+    @Test
+    fun serviceUpdate_withoutDeviceIdOrHost_isDropped() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+
+        bridge.fireServiceFound("svc-a")
+        bridge.fireMonitorUpdated(resolvedData(serviceName = "svc-a", deviceId = null))
+        bridge.fireMonitorUpdated(resolvedData(serviceName = "svc-b", host = null))
+
+        assertTrue(directory.seenCalls.isEmpty())
+    }
+
+    // ------------------------------------------------------------------
+    // Lost mapping (C3.3) + sweeper hook (C3.5 groundwork)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun monitorLost_mapsToTypedLostViaReverseLookup() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+        val recorder = EventRecorder(transport)
+
+        directory.seenResults.addLast(DiffFound(endpointOf("peer-1")))
+        bridge.fireServiceFound("Flash Peer")
+        bridge.fireMonitorUpdated(resolvedData())
+
+        directory.lostResult = DiffLost("peer-1")
+        bridge.fireMonitorLost("Flash Peer")
+
+        val lost = recorder.received.filterIsInstance<FlashTransportEvent.Lost>()
+        assertEquals(1, lost.size)
+        assertEquals("peer-1", lost.single().deviceId.value)
+        assertEquals("Flash Peer", lost.single().serviceName)
+        assertEquals(listOf(FlashDeviceId("peer-1")), directory.lostCalls)
+        recorder.cancel()
+    }
+
+    // ------------------------------------------------------------------
+    // Retry policy re-browse (C3.3) + API-level branch selection (C3.4)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun legacyApi_browsesWithoutNetworkRequest_andResolvesViaQueue() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 30, directory = FakeDirectory(), bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+
+        bridge.fireServiceFound("legacy-peer")
+
+        val request = bridge.browseRequests.single()
+        assertFalse(request.useNetworkRequestDiscovery)
+        assertEquals(ResolutionStrategy.LEGACY_RESOLVE_QUEUE, bridge.monitorRequests.single().strategy)
+    }
+
+    @Test
+    fun api34_browsesWithNetworkRequest_andMonitorsContinuously() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+
+        bridge.fireServiceFound("modern-peer")
+
+        val request = bridge.browseRequests.single()
+        assertTrue(request.useNetworkRequestDiscovery)
+        assertEquals(ResolutionStrategy.INFO_CALLBACK, bridge.monitorRequests.single().strategy)
+    }
+
+    @Test
+    fun startFailures_reBrowseUntilAttemptBudgetExhausted_thenGiveUp() {
+        val bridge = FakeBridge().apply { startBrowseResult = false }
+        val delays = mutableListOf<Long>()
+        val transport = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge, maxRestarts = 2, delays = delays)
+        val recorder = EventRecorder(transport)
+
+        runBlocking { transport.startBrowsing() }
+
+        // Attempt budget 2 → 3 total initiation attempts (initial + 2 retries), then give-up.
+        assertEquals(3, bridge.browseRequests.size)
+        assertEquals(listOf(1_000L, 2_000L), delays)
+        val giveUp = recorder.received.filterIsInstance<FlashTransportEvent.StateChanged>().last()
+        assertFalse(giveUp.browsing)
+        recorder.cancel()
+
+        // Runtime onStartFailed after a successful start also schedules a capped retry loop.
+        val bridge2 = FakeBridge()
+        val transport2 = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge2, maxRestarts = 1)
+        runBlocking { transport2.startBrowsing() }
+        bridge2.fireBrowseStartFailed(errorCode = 3)
+        assertEquals(2, bridge2.browseRequests.size)
+    }
+
+    @Test
+    fun multicastLock_acquiredOnlyBelowThreshold() {
+        val oldBridge = FakeBridge()
+        val oldTransport = newTransport(apiLevel = 33, directory = FakeDirectory(), bridge = oldBridge)
+        runBlocking { oldTransport.startBrowsing() }
+        assertTrue(oldBridge.lockStates.contains(true))
+
+        val newBridge = FakeBridge()
+        val newTransport = newTransport(apiLevel = 35, directory = FakeDirectory(), bridge = newBridge)
+        runBlocking { newTransport.startBrowsing() }
+        assertFalse(newBridge.lockStates.contains(true))
+    }
+
+    @Test
+    fun stop_releasesRadioResources() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 33, directory = FakeDirectory(), bridge = bridge)
+        runBlocking {
+            transport.startAdvertising(45821, identity())
+            transport.startBrowsing()
+            transport.stop()
+        }
+        assertTrue(bridge.stopBrowseCalled)
+        assertTrue(bridge.unadvertiseCalled)
+        assertTrue(bridge.monitorsCancelled)
+        assertEquals(false, bridge.lockStates.last())
+    }
+
+    // ------------------------------------------------------------------
+
+    private fun endpointOf(id: String) = FlashDiscoveredEndpoint(
+        device = com.transfer.flash.core.common.model.FlashDevice(
+            FlashDeviceId(id),
+            "Peer Name",
+            com.transfer.flash.core.common.model.FlashTransportType.LAN,
+        ),
+        hostAddress = "192.168.1.50",
+        port = 45821,
+        serviceName = "Flash Peer",
+    )
+}

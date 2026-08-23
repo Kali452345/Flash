@@ -4,10 +4,10 @@
 `main` — remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
 
 ## Last verified build
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **413 tests / 0 failures**.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase P2 COMPLETE (2026-08-22): :core:security full stack landed — crypto/ (Keystore ECDSA P-256 identity w/ StrongBox fallback, ephemeral-software ECDH P-256 → HKDF-SHA256 → AES-256-GCM frame codec w/ RFC 5869 test vectors, SHA-256 fingerprints + constant-time compares, platform-generated self-signed cert — no BouncyCastle), trust/pinned/ (RoomTrustedStore fingerprint pinning + idempotent legacy migration, pure TofuPolicy fail-closed), pairing/ (frames, symmetric 6-digit numeric-comparison code per BT-SSP precedent, pure timeout-aware state machine mapped to UI-032 phases, DefaultFlashPairingProtocol orchestrator). Keystore/E2E-on-device runtime verification pending (JVM tests use SoftwareFlashCrypto). P0+P1 done earlier same day. Next: Phase P3 (C3 discovery continuous mode). All UI IDs IMPLEMENTED except UI-045 gate.**
+**Phase P3 (LAN half) COMPLETE (2026-08-22): continuous identity-aware discovery landed — `core/FlashRadioTransport` seam + `FlashAdvertisedIdentity`/events, `StandardEndpointDirectory` (dedup/seen-timestamps/aging diffs), `TxtCodec` ({device_id,name,model,proto} cross-radio contract), `DiscoveryRetryPolicy`, `CompositeDiscovery` (per-radio directories, cross-radio dedup LAN>WFD>AWARE>BLE w/ loss hysteresis, `startAll(port, identity)` = advertise+browse everywhere, `sweep()` 30s grace per ADR-012), `nsd/NsdTransport` (TXT advertise + self-filter C3.2; browse-until-stop w/ capped restarts C3.3; API>=34 ServiceInfoCallback vs <34 hardened resolve-queue split + NetworkRequest-scoped discovery API 33+ per research thresholds in NsdApiLevel.kt). NsdFlashDiscovery untouched (R4). Remaining P3: engine wiring of periodic sweep caller + C3.11 two-phone device battery. Next: P4 (C4 network TLS+resilience) or device battery first — owner's call.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -71,10 +71,10 @@
 - None.
 
 ## Last change
-Phase P2 executed: :core:security crypto primitives (KeystoreFlashCrypto / SoftwareFlashCrypto / Hkdf / E2eFrameCodec / FlashFingerprint), Room-backed pinned trust store + TOFU policy + legacy migration, pairing frames + numeric-comparison 6-digit code + pure state machine + protocol orchestrator. Lead integration fixes: missing KeyPairGenerator import + generateKeyPair name collision; Flow.map vs FlashResult.map overload collision in RoomTrustedStore (rewrote as try/catch); TofuPolicy nullable-arg mismatch; PeerDeclined reducer contradiction w/ its own total-reducer principle; test-dispatcher pumping for replay=0 SharedFlow collectors; PAIR_CONFIRM direction fix in the handshake test.
+Phase P3 LAN half executed via two parallel research-first subagents (pure-logic core: directory/TXT/retry/composite; Android NSD transport) against lead-written contracts. Lead integration fixes: missing ServiceInfoCallback.onServiceLost() no-arg override + nullable serviceName propagation; missing onSuccess import; five test-side bugs — positional harness getters crossing transports when names reversed, inclusive-grace boundary trips, Found events counted in a Lost-only assertion, stale endpoint data in a canned Updated diff, wrong sweep scenario data.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **413 tests / 0 failures** (+73). Recurrent Kotlin-daemon crashes from E:-drive I/O drops persist (recovered each time via --stop / fresh daemon).
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **462 tests / 0 failures** (+49).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -99,7 +99,12 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Execute Phase P3 — Discovery continuous mode (C3.0 research → C3.1–C3.5: FlashRadioTransport seam, identity-aware TXT advertising, continuous browsing w/ auto-restart + lost-peer aging sweeper, API-34+ registerServiceInfoCallback resolution split, NetworkRequest-scoped discovery)** per `docs/core-upgrade-plan.md`, then two-phone device battery (C3.11). Device backlog additions: SQLCipher encrypted-open smoke; Hilt-graph launch check; UI-040 sound toggle QA; Keystore identity-key generation on device.
+**Either (owner's call): run the C3.11 two-phone device battery now (cold join / hot leave / Wi-Fi toggle / AP roam; record timings in logs/experiments.md), or proceed to Phase P4 — `:core:network` TLS + resilience (C4.0 research → C4.9)** per `docs/core-upgrade-plan.md`. Engine wiring of the periodic sweep caller lands with C7. Device backlog: SQLCipher encrypted-open smoke; Hilt-graph launch check; UI-040 sound toggle QA; Keystore identity-key generation on device.
+
+## 2026-08-22 - P3 NSD session note (agent handoff)
+- LAN MVP networking now has `nsd/NsdTransport.kt` (:core:discovery) implementing FlashRadioTransport C3.2-C3.4 (identity TXT advertise + self-filter, continuous browse w/ capped restarts, API>=34 ServiceInfoCallback vs <34 hardened NsdResolveQueue split, NetworkRequest-scoped discovery API 33+). `NsdFlashDiscovery` untouched (R4). NOT yet Gradle-verified (forbidden session) - run testDebugUnitTest first; tests: nsd/NsdTransportLogicTest.kt (pure-JVM, no coroutines-test dep in module).
+- API thresholds + citations live in `NsdApiLevel.kt` KDoc and logs/progress.md entry of same date. DiscoveryRequest combined API (T-ext 22 / SDK 37) deliberately deferred.
+
 
 ## DEVICE TESTING BACKLOG (for owner)
 Priority order; each item = install latest debug APK, exercise, report pass/fail:
@@ -130,3 +135,9 @@ $env:JAVA_HOME="E:\AndroidDev\AndroidStudio\android-studio\jbr"; $env:PATH="$env
 - `ui/chat/src/main/java/com/transfer/flash/ui/chat/FlashStressTestScreen.kt` (entry-point wiring)
 - `docs/ui/performance.md` (device measurement plan for UI-042/043 numbers)
 - Integration files from Deferred block: FlashNavigation.kt, FlashNetworkSimSheet.kt, FlashEncryptionIndicators.kt, FlashPairingFlow.kt
+
+## 2026-08-22 - P3 pure-logic agent handoff (C3.3/C3.5/C3.9)
+- Created (ONLY these): `core/discovery/.../core/{StandardEndpointDirectory,TxtCodec,DiscoveryRetryPolicy,CompositeDiscovery}.kt` + 4 matching JUnit4 test classes under src/test. NO existing file touched; nsd/** untouched.
+- CompositeDiscovery implements existing FlashDiscovery + `startAll(port, identity)` aggregate + `sweep(nowMs, grace=30_000)` + `mergedEvents` SharedFlow(DROP_OLDEST); dedup across transports by deviceId, priority LAN > WIFI_DIRECT > WIFI_AWARE > BLE, loss hysteresis emits Updated(fallback) not Lost while a lower radio still sees the peer.
+- Deterministic tests without coroutines-test: synchronous DirectDispatcher injected via optional scopeFactory ctor param + explicit clock lambda + local FakeTransport.
+- NOT Gradle-verified (forbidden session) - run testDebugUnitTest first; expect ~+25 tests. Full details + research URLs: logs/progress.md entry of this date; decisions: ADR-010.

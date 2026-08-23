@@ -1,0 +1,459 @@
+package com.transfer.flash.core.discovery.core
+
+import com.transfer.flash.core.common.model.FlashDeviceId
+import com.transfer.flash.core.common.result.FlashError
+import com.transfer.flash.core.common.result.FlashResult
+import com.transfer.flash.core.common.result.onSuccess
+import com.transfer.flash.core.discovery.FlashDiscovery
+import com.transfer.flash.core.discovery.FlashDiscoveryState
+import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import java.util.Locale
+
+/**
+ * Multi-radio discovery facade (plan C3.9). Implements the existing
+ * [FlashDiscovery] interface on top of N [FlashRadioTransport]s.
+ *
+ * Architecture (research-backed, see logs/experiments.md EXP entries + plan C3):
+ *
+ * **Event log + snapshot pattern.** All transports' events are merged into one
+ * [mergedEvents] [SharedFlow] while [discoveredEndpoints] is a [StateFlow]
+ * rebuilt from the per-transport [EndpointDirectory]s on every diff. This split
+ * is deliberate: StateFlow conflates updates by equality (kotlinx docs,
+ * https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/),
+ * so pushing discrete Found/Updated/Lost *events* through a StateFlow would
+ * silently drop intermediate transitions for slow collectors — e.g., a
+ * Found followed quickly by Lost could collapse and consumers would never see
+ * either. Snapshots, by contrast, are idempotent full-state values where
+ * conflation is exactly the desired behavior. Hence: events → SharedFlow with
+ * extra buffering and DROP_OLDEST overflow (slow UI consumers lose the oldest
+ * cosmetic events rather than blocking radio threads or crashing with
+ * BufferOverflowException); state → StateFlow.
+ *
+ * **Cross-radio dedup by deviceId.** One directory per transport keeps
+ * per-radio truth; the global endpoint list collapses peers seen on multiple
+ * radios into ONE endpoint reported via the highest-priority transport:
+ * `LAN > WIFI_DIRECT > WIFI_AWARE > BLE`. Priority rationale: Android's own
+ * connectivity stack scores/ranks networks by transport policy
+ * (https://source.android.com/docs/core/connect/network-selection) and treats
+ * transports as capabilities ranked per request
+ * (https://developer.android.com/reference/android/net/NetworkCapabilities);
+ * Nearby Connections exposes explicit strategy choices trading bandwidth vs
+ * topology (https://developers.google.com/android/reference/com/google/android/gms/nearby/connection/Strategy).
+ * LAN wins because it offers the highest sustained throughput through the AP
+ * infrastructure; Wi-Fi Direct next (direct P2P, no AP needed but slower in
+ * practice per our own benchmarks); Wi-Fi Aware after (higher throughput than
+ * BLE across longer range — https://developer.android.com/develop/connectivity/wifi/wifi-aware);
+ * BLE last as a presence-only signal (plan C3.8). Unknown transport names rank
+ * below all known ones.
+ *
+ * **Hysteresis on loss.** When the highest-priority transport reports a peer
+ * Lost while the same deviceId is still alive in a lower-priority directory,
+ * the composite does NOT emit Lost; it emits Updated carrying the fallback
+ * endpoint. Rationale: "peer gone" would be factually wrong (the peer is still
+ * reachable), and flapping the UI between Lost/Found as radios disagree is
+ * worse than briefly reporting a slower path. A real Lost is emitted only when
+ * the last sighting disappears (radio goodbye or sweeper aging).
+ *
+ * **Presence sweeping (plan C3.5).** Radios miss goodbye packets routinely —
+ * mDNS goodbyes are TTL=0 records (RFC 6762 §10.1,
+ * https://datatracker.ietf.org/doc/html/rfc6762#section-10.1) that many stacks
+ * never send on crash/kill, forcing waiters to fall back to record expiry:
+ * 120 s for SRV/A/AAAA records, 75 min for PTR/TXT
+ * (RFC 6762 §10; https://datatracker.ietf.org/doc/html/rfc6762#section-10).
+ * Waiting out even the 120 s SRV TTL is far too slow for chat-style presence.
+ * Default grace of 30 s matches plan C3.5's example: short enough that peer
+ * departure converges within half a minute, long enough to ride out single
+ * missed re-announcements without flapping during brief Wi-Fi drops. Callers
+ * drive [sweep] periodically with explicit timestamps (pure logic, testable).
+ *
+ * Threading: event handling mutates internal maps under a lock; flows are
+ * thread-safe. Collectors are launched lazily into an injected scope so tests
+ * can supply a synchronous dispatcher for deterministic assertions.
+ */
+class CompositeDiscovery(
+    private val transports: List<FlashRadioTransport>,
+    private val directoryFactory: () -> EndpointDirectory = { StandardEndpointDirectory() },
+    scopeFactory: () -> CoroutineScope = { CoroutineScope(SupervisorJob() + Dispatchers.Default) },
+    private val clock: () -> Long = { System.currentTimeMillis() },
+) : FlashDiscovery {
+
+    companion object {
+        /**
+         * Default presence grace window (ms) for [sweep]. See class KDoc for
+         * the mDNS-TTL research behind choosing 30 s.
+         */
+        const val DEFAULT_GRACE_MS: Long = 30_000L
+
+        /** Highest priority first; unknown names rank after these. */
+        val PRIORITY_ORDER: List<String> = listOf("LAN", "WIFI_DIRECT", "WIFI_AWARE", "BLE")
+
+        fun priorityRank(transportName: String): Int {
+            val idx = PRIORITY_ORDER.indexOf(transportName.uppercase(Locale.ROOT))
+            return if (idx >= 0) idx else PRIORITY_ORDER.size
+        }
+    }
+
+    private val scope: CoroutineScope = scopeFactory()
+    private val lock = Any()
+    private val directories = HashMap<String, EndpointDirectory>()
+    private val browsingByTransport = HashMap<String, Boolean>()
+    private val advertisingByTransport = HashMap<String, Boolean>()
+    private var collecting = false
+
+    private var advertisedPort: Int = 0
+    private var identity: FlashAdvertisedIdentity? = null
+
+    private val _mergedEvents = MutableSharedFlow<FlashTransportEvent>(
+        replay = 0,
+        extraBufferCapacity = EXTRA_BUFFER_CAPACITY,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * Merged, deduplicated event stream from all transports (plus composite-
+     * generated Lost/Updated from sweeps and cross-transport hysteresis).
+     * Live traffic only — no replay, matching FlashTransportEvent semantics;
+     * buffer absorbs bursts, DROP_OLDEST sheds oldest events under overload.
+     */
+    val mergedEvents: SharedFlow<FlashTransportEvent> = _mergedEvents
+
+    private val _discoveredEndpoints =
+        MutableStateFlow<List<FlashDiscoveredEndpoint>>(emptyList())
+    override val discoveredEndpoints: StateFlow<List<FlashDiscoveredEndpoint>> =
+        _discoveredEndpoints
+
+    private val _state = MutableStateFlow(FlashDiscoveryState())
+    override val state: StateFlow<FlashDiscoveryState> = _state
+
+    // ---------------------------------------------------------------------
+    // FlashDiscovery API
+    // ---------------------------------------------------------------------
+
+    /** Starts continuous browsing on EVERY transport (aggregate result). */
+    override suspend fun startDiscovery(): FlashResult<Unit> = aggregate { transport ->
+        transport.startBrowsing().onSuccess { markBrowsing(transport.transportName, true) }
+    }
+
+    /**
+     * Stops browsing everywhere. The radio seam only exposes full [FlashRadioTransport.stop],
+     * so this stops advertising too and then transparently restarts advertising
+     * when it was previously active (identity retained from startAll).
+     */
+    override suspend fun stopDiscovery(): FlashResult<Unit> {
+        val resumeAdvertising = _state.value.isAdvertising
+        val result = aggregate { transport ->
+            transport.stop().onSuccess {
+                markBrowsing(transport.transportName, false)
+                markAdvertising(transport.transportName, false)
+            }
+        }
+        refreshState()
+        if (resumeAdvertising) {
+            identity?.let { startAdvertisingInternal(advertisedPort, it) }
+        }
+        return result
+    }
+
+    /**
+     * Starts advertising using the identity previously supplied to [startAll].
+     * Returns Failure when no identity has been set yet — bare-port advertising
+     * cannot construct TXT records.
+     */
+    override suspend fun startAdvertising(listenPort: Int): FlashResult<Unit> {
+        val id = identity
+            ?: return FlashResult.Failure(
+                FlashError.Unknown("No advertised identity set; call startAll(port, identity) first"),
+            )
+        return startAdvertisingInternal(listenPort, id)
+    }
+
+    /**
+     * Stops advertising everywhere; browsing is transparently restarted where
+     * it was active (radio seam only offers full stop).
+     */
+    override suspend fun stopAdvertising(): FlashResult<Unit> {
+        val resumeBrowsing = _state.value.isDiscovering
+        val result = aggregate { transport ->
+            transport.stop().onSuccess {
+                markBrowsing(transport.transportName, false)
+                markAdvertising(transport.transportName, false)
+            }
+        }
+        refreshState()
+        if (resumeBrowsing) {
+            aggregate { transport ->
+                transport.startBrowsing().onSuccess { markBrowsing(transport.transportName, true) }
+            }
+        }
+        return result
+    }
+
+    override suspend fun stopAll(): FlashResult<Unit> {
+        val result = aggregate { transport ->
+            transport.stop().onSuccess {
+                markBrowsing(transport.transportName, false)
+                markAdvertising(transport.transportName, false)
+            }
+        }
+        refreshState()
+        return result
+    }
+
+    // ---------------------------------------------------------------------
+    // Plan C3.9 contract
+    // ---------------------------------------------------------------------
+
+    /**
+     * Advertises AND browses on EVERY transport. Success iff every transport
+     * succeeded at both; otherwise Failure(FlashError.Unknown) whose message
+     * lists which transports failed and why. Partially-started transports keep
+     * running (flags reflect reality) so callers can stopAll() cleanly.
+     */
+    suspend fun startAll(port: Int, identity: FlashAdvertisedIdentity): FlashResult<Unit> {
+        this.identity = identity
+        this.advertisedPort = port
+        val failures = mutableListOf<String>()
+        synchronized(lock) { collectingOrStart() }
+        for (transport in transports) {
+            val advResult = transport.startAdvertising(port, identity)
+            val browseResult = transport.startBrowsing()
+            val ok = mutableListOf<String>()
+            if (advResult.isSuccess) markAdvertising(transport.transportName, true) else ok += "advertising"
+            if (browseResult.isSuccess) markBrowsing(transport.transportName, true) else ok += "browsing"
+            if (ok.isNotEmpty()) {
+                val reason = listOfNotNull(
+                    (advResult as? FlashResult.Failure)?.error?.takeIf { "advertising" in ok },
+                    (browseResult as? FlashResult.Failure)?.error?.takeIf { "browsing" in ok },
+                ).joinToString("; ")
+                failures += "${transport.transportName} failed ${ok.joinToString("+")}: $reason"
+            }
+        }
+        refreshState()
+        return if (failures.isEmpty()) {
+            FlashResult.Success(Unit)
+        } else {
+            FlashResult.Failure(FlashError.Unknown(failures.joinToString(" | ")))
+        }
+    }
+
+    private data class AgedOut(val deviceId: FlashDeviceId, val serviceName: String?)
+
+    /**
+     * Ages out endpoints not re-seen within [graceWindowMs] (boundary: an age
+     * of EXACTLY the window counts as expired). Emits Lost once per aged-out
+     * peer — or Updated when another transport still reports it alive
+     * (hysteresis). Idempotent per instant: repeated calls at the same or later
+     * time produce no duplicates because aged entries were removed.
+     */
+    fun sweep(nowMs: Long, graceWindowMs: Long = DEFAULT_GRACE_MS) {
+        val agedOut = mutableListOf<AgedOut>()
+        synchronized(lock) {
+            val serviceNames = HashMap<FlashDeviceId, String>()
+            for (transport in transports) {
+                directoryFor(transport.transportName).snapshot().forEach {
+                    serviceNames[it.endpoint.deviceId] = it.endpoint.serviceName
+                }
+            }
+            for (transport in transports) {
+                val lost = directoryFor(transport.transportName)
+                    .sweepExpired(graceWindowMs, nowMs)
+                lost.forEach { diff ->
+                    agedOut += AgedOut(diff.deviceId, serviceNames[diff.deviceId])
+                }
+            }
+            rebuildEndpointsLocked()
+        }
+        for (aged in agedOut) {
+            synchronized(lock) {
+                val representative = globalRepresentativeLocked(aged.deviceId)
+                if (representative != null) {
+                    // Hysteresis: peer alive on a lower-priority radio — no Lost.
+                    _mergedEvents.tryEmit(FlashTransportEvent.Updated(representative.endpoint))
+                } else {
+                    _mergedEvents.tryEmit(
+                        FlashTransportEvent.Lost(aged.deviceId, aged.serviceName),
+                    )
+                }
+            }
+        }
+        refreshState()
+    }
+
+    // ---------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------
+
+    private suspend fun aggregate(
+        action: suspend (FlashRadioTransport) -> FlashResult<Unit>,
+    ): FlashResult<Unit> {
+        synchronized(lock) { collectingOrStart() }
+        val failures = mutableListOf<String>()
+        for (transport in transports) {
+            when (val result = action(transport)) {
+                is FlashResult.Success -> Unit
+                is FlashResult.Failure ->
+                    failures += "${transport.transportName}: ${result.error}"
+            }
+        }
+        refreshState()
+        return if (failures.isEmpty()) FlashResult.Success(Unit)
+        else FlashResult.Failure(FlashError.Unknown(failures.joinToString("; ")))
+    }
+
+    private suspend fun startAdvertisingInternal(
+        port: Int,
+        identity: FlashAdvertisedIdentity,
+    ): FlashResult<Unit> = aggregate { transport ->
+        transport.startAdvertising(port, identity)
+            .onSuccess {
+                advertisedPort = port
+                markAdvertising(transport.transportName, true)
+            }
+    }
+
+    private fun directoryFor(transportName: String): EndpointDirectory =
+        directories.getOrPut(transportName) { directoryFactory() }
+
+    private fun markBrowsing(name: String, value: Boolean) = synchronized(lock) {
+        browsingByTransport[name] = value
+    }
+
+    private fun markAdvertising(name: String, value: Boolean) = synchronized(lock) {
+        advertisingByTransport[name] = value
+    }
+
+    private fun collectingOrStart() {
+        if (collecting) return
+        collecting = true
+        for (transport in transports) {
+            scope.launch {
+                transport.events.collect { event -> handleEvent(transport, event) }
+            }
+        }
+    }
+
+    private fun handleEvent(transport: FlashRadioTransport, event: FlashTransportEvent) {
+        when (event) {
+            is FlashTransportEvent.Found -> applySighting(transport, event.endpoint)
+            is FlashTransportEvent.Updated -> applySighting(transport, event.endpoint)
+            is FlashTransportEvent.Lost -> applyLoss(transport, event.deviceId)
+            is FlashTransportEvent.StateChanged -> refreshState()
+        }
+    }
+
+    private fun applySighting(transport: FlashRadioTransport, endpoint: FlashDiscoveredEndpoint) {
+        synchronized(lock) {
+            val deviceId = endpoint.deviceId
+            val previousRepresentative = globalRepresentativeLocked(deviceId)
+            when (directoryFor(transport.transportName).applySeen(endpoint, clock())) {
+                is EndpointDirectory.Diff.Unchanged -> return
+                else -> Unit
+            }
+            val newRepresentative = globalRepresentativeLocked(deviceId)
+            when {
+                previousRepresentative == null ->
+                    _mergedEvents.tryEmit(FlashTransportEvent.Found(newRepresentative!!.endpoint))
+                newRepresentative != previousRepresentative ->
+                    _mergedEvents.tryEmit(FlashTransportEvent.Updated(newRepresentative!!.endpoint))
+                // Else: lower-priority sighting absorbed silently; snapshot unchanged.
+            }
+            rebuildEndpointsLocked()
+        }
+    }
+
+    private fun applyLoss(transport: FlashRadioTransport, deviceId: FlashDeviceId) {
+        synchronized(lock) {
+            val serviceName = directoryFor(transport.transportName)
+                .get(deviceId)?.endpoint?.serviceName
+            when (directoryFor(transport.transportName).applyLost(deviceId)) {
+                is EndpointDirectory.Diff.Lost -> {
+                    rebuildEndpointsLocked()
+                    val representative = globalRepresentativeLocked(deviceId)
+                    if (representative != null) {
+                        _mergedEvents.tryEmit(FlashTransportEvent.Updated(representative.endpoint))
+                    } else {
+                        _mergedEvents.tryEmit(FlashTransportEvent.Lost(deviceId, serviceName))
+                    }
+                }
+                else -> Unit
+            }
+        }
+    }
+
+    /**
+     * Best-known entry for a deviceId across ALL directories: lowest priority
+     * rank wins; ties broken by most recent sighting.
+     */
+    private fun globalRepresentativeLocked(deviceId: FlashDeviceId): EndpointDirectory.Entry? {
+        var best: EndpointDirectory.Entry? = null
+        var bestRank = Int.MAX_VALUE
+        for (transport in transports) {
+            val rank = priorityRank(transport.transportName)
+            val entry = directoryFor(transport.transportName).get(deviceId) ?: continue
+            val current = best
+            if (current == null ||
+                rank < bestRank ||
+                (rank == bestRank && entry.lastSeenAtMs > current.lastSeenAtMs)
+            ) {
+                best = entry
+                bestRank = rank
+            }
+        }
+        return best
+    }
+
+    private fun rebuildEndpointsLocked() {
+        data class Rep(val rank: Int, val entry: EndpointDirectory.Entry)
+
+        val representatives = HashMap<FlashDeviceId, Rep>()
+        for (transport in transports) {
+            val rank = priorityRank(transport.transportName)
+            for (entry in directoryFor(transport.transportName).snapshot()) {
+                val deviceId = entry.endpoint.deviceId
+                val current = representatives[deviceId]
+                if (current == null ||
+                    rank < current.rank ||
+                    (rank == current.rank && entry.lastSeenAtMs > current.entry.lastSeenAtMs)
+                ) {
+                    representatives[deviceId] = Rep(rank, entry)
+                }
+            }
+        }
+        _discoveredEndpoints.value = representatives.values
+            .map { it.entry }
+            .sortedWith(
+                compareByDescending<EndpointDirectory.Entry> { it.lastSeenAtMs }
+                    .thenComparator { a, b ->
+                        a.endpoint.deviceId.value.compareTo(b.endpoint.deviceId.value)
+                    },
+            )
+            .map { it.endpoint }
+    }
+
+    private fun refreshState() = synchronized(lock) {
+        val anyBrowsing = browsingByTransport.values.any { it }
+        val anyAdvertising = advertisingByTransport.values.any { it }
+        val message = when {
+            anyBrowsing && anyAdvertising -> "Advertising and browsing"
+            anyBrowsing -> "Browsing"
+            anyAdvertising -> "Advertising"
+            else -> "Idle"
+        }
+        _state.value = FlashDiscoveryState(
+            isDiscovering = anyBrowsing,
+            isAdvertising = anyAdvertising,
+            advertisedPort = advertisedPort,
+            statusMessage = message,
+        )
+    }
+}
+
+private const val EXTRA_BUFFER_CAPACITY = 256

@@ -1,6 +1,43 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-22 - Phase P3 partial: NSD continuous transport (C3.2-C3.4)
+
+### Worked on
+Implemented `NsdTransport : FlashRadioTransport` (identity-aware advertising, continuous browsing with capped auto-restart, API-level-split resolution) plus `NsdApiLevel` threshold isolation and JVM tests, per plan C3.0-C3.4 and R1 research-first rule.
+
+### Research findings (R1, cited in code KDoc)
+- (a) `registerServiceInfoCallback(NsdServiceInfo, Executor, ServiceInfoCallback)` = **API 34** (T-ext 7); legacy `resolveService` **deprecated API 34**; on <34 must keep ResolveListener path: https://developer.android.com/reference/kotlin/android/net/nsd/NsdManager + https://developer.android.com/reference/kotlin/android/net/nsd/NsdManager.ServiceInfoCallback
+- (b) `discoverServices(String, Int, NetworkRequest, Executor, DiscoveryListener)` added **API 33 (not 34)**; tracks network changes automatically -> proper Found/Lost across Wi-Fi drops/rejoins; requires ACCESS_NETWORK_STATE: https://developer.android.com/sdk/api_diff/33/changes/android.net.nsd.NsdManager ; fallback = legacy PROTOCOL_DNS_SD call.
+- (c) DiscoveryRequest combined discover+monitor (`registerServiceInfoCallback(DiscoveryRequest, ...)`) added **API 37 SDK level**, but docs state runtime availability from **"T extensions 22"** covering all Android 14+ (gate = `SdkExtensions.getExtensionVersion(T) >= 22`). DECISION: not adopted now (extension-version gating complexity, no need yet); noted as future step alongside API 37 ACCESS_LOCAL_NETWORK picker flows: https://developer.android.com/reference/kotlin/android/net/nsd/NsdManager
+- (d) Multicast lock required before T-extensions 7; from T-ext 7 system manages foreground multicast reception and background apps should avoid the lock. Conservative approximation used: skip lock when sdkInt >= 34 (all Android 14+ have T-ext >= 7); acquire otherwise (safe direction): https://developer.android.com/reference/android/net/wifi/WifiManager.MulticastLock + NsdManager "Wi-Fi Multicast Lock" doc section.
+- (e) `NsdServiceInfo.getNetwork()/setNetwork()` both **API 33** (T-ext 3); setNetwork(null)=all networks: https://developer.android.com/reference/kotlin/android/net/nsd/NsdServiceInfo
+
+### Changed (files created ONLY; zero modifications to existing files/gradle)
+- `core/discovery/src/main/java/com/transfer/flash/core/discovery/nsd/NsdTransport.kt` - `NsdManagerBridge` seam + neutral callback models (AdvertiseRequest/BrowseRequest/MonitorRequest/ResolvedServiceData), `RealNsdManagerBridge` (real NsdManager + WifiManager multicast lock + NetworkRequest(TRANSPORT_WIFI|ETHERNET) discovery w/ legacy fallback + owns EXISTING hardened NsdResolveQueue for <34 path -> ERROR-006 protections preserved untouched), pure `NsdTxtCodec` ({device_id,name,model,proto} key set mirroring core.TxtCodec for future unification), pure `NsdRestartPolicy` (capped exponential backoff 1s..30s), and `NsdTransport` itself (TXT advertise + identity self-filter C3.2; browse-until-stop loop w/ retry-on-failure C3.3; >=34 registerServiceInfoCallback vs <34 resolve-queue split + NetworkRequest-scoped discovery C3.4; directory diff -> Found/Updated/Lost event mapping incl. serviceName reverse lookup; `pollSweep()` hook for engine sweeper C3.5).
+- `core/discovery/src/main/java/com/transfer/flash/core/discovery/nsd/NsdApiLevel.kt` - `interface NsdApiLevel { val sdkInt }` + `BuildNsdApiLevel` + `NsdApiThresholds` constants documenting all researched levels (34 service-info-callback / 33 network-request discovery / 33 network field / 34 multicast-lock-not-needed).
+- `core/discovery/src/test/java/com/transfer/flash/core/discovery/nsd/NsdTransportLogicTest.kt` - 13 JVM tests: TXT encode/decode fallbacks, restart-policy give-up math, TXT advertisement content, self-filter by deviceId BEFORE directory, Found-then-Updated mapping through directory diffs, drop-without-device_id/host, radio-loss -> single typed Lost w/ serviceName, legacy-vs-API34 branch selection recorded via fake bridge calls, capped re-browse attempts (3 requests @ budget 2 + runtime onStartFailed restart), multicast lock only below threshold, stop() releases everything.
+
+### Verification
+- NOT run (Gradle forbidden this session). Written against verified deps (:core:common, junit present; kotlinx-coroutines-test NOT present in core/discovery/build.gradle.kts - see deviations). Existing files/tests untouched (R4).
+
+### Deviations
+1. **kotlinx-coroutines-test unavailable**: module build.gradle.kts has only junit as testImplementation and gradle is read-only -> tests use injected no-op `sleep` + Dispatchers.Unconfined (launches execute inline; deterministic without virtual time). Retry delays asserted via recorded provider outputs instead of advanceTimeBy.
+2. **Internal scope ownership** (pre-approved deviation): NsdTransport lazily creates CoroutineScope(SupervisorJob()+dispatcher), cancels in stop(); rationale documented in class KDoc (radio lifecycle == scope lifetime; post-stop callbacks would violate Lost contract).
+3. **Context parameter nullable** (`context: Context?`) so JVM tests can construct with bridgeOverride=null-context combo; init requires one of context/bridge.
+4. **Radio loss emits exactly one Lost** (with known serviceName) while still calling directory.applyLost - avoids duplicate events from Diff.Lost mapping.
+5. **NsdTxtCodec duplicates core.TxtCodec key set deliberately** (compile-independence from concurrent agent); TODO(unify) noted.
+6. **lane dispatcher falls back to raw dispatcher** when limitedParallelism unsupported (Unconfined throws USOE - verified against kotlinx.coroutines source); production IO gets real parallelism-1 view.
+7. **Logging injectable** (logInfo/logWarn defaults to android.util.Log) because module lacks unitTests.returnDefaultValues; JVM tests would crash on Log stubs otherwise.
+
+### Remaining
+- Consolidated Gradle run (testDebugUnitTest) by owner/next session.
+- Engine wiring: periodic sweep caller, EndpointDirectory impl (concurrent agent), CompositeDiscovery (C3.9).
+- C3.11 device battery (see below).
+
+### Next AI
+1) Run testDebugUnitTest; fix reds + log ERROR-0XX. 2) Wire StandardEndpointDirectory + sweeper into NsdTransport.pollSweep(). 3) Device battery: cold join, hot leave, Wi-Fi toggle, AP roam timings -> logs/experiments.md; verify multicast-lock behavior on Android 13 non-T-ext7 device specifically.
+
 ## 2026-08-22 — Phase P2 Executed (:core:security full stack)
 
 ### Worked on
@@ -2012,3 +2049,37 @@ Implemented C2.4 (Room-backed trust/pin store), C2.5 (TOFU policy), C2.6 (pairin
 
 ### Next AI
 1) Run consolidated testDebugUnitTest (agents normally run one Gradle pass per session " this session was blocked from doing so); expect +~30 tests. 2) Fix anything red, log errors per ERROR-0XX. 3) Coordinate with crypto agent for FlashCrypto injection into ephemeralPublicKeyProvider. 4) Update handoff.md.
+
+## 2026-08-22 - P3 pure-logic: StandardEndpointDirectory, TxtCodec, DiscoveryRetryPolicy, CompositeDiscovery (C3.3/C3.5/C3.9)
+
+### Worked on
+Pure-JVM half of Phase P3 per task brief: directory bookkeeping, cross-radio TXT contract, deterministic retry math, multi-radio composite discovery. nsd/** untouched; no imports from nsd (own FakeTransport used).
+
+### R1 research (citations also embedded in CompositeDiscovery KDoc)
+- (a) mDNS goodbye/TTL semantics: RFC 6762 sec 10.1 goodbyes are TTL=0 records many stacks never send on crash/kill (https://datatracker.ietf.org/doc/html/rfc6762#section-10.1); record TTLs: SRV/A/AAAA ~120 s, PTR/TXT 75 min (sec 10, https://datatracker.ietf.org/doc/html/rfc6762#section-10; corroborated by systemd resolved goodbye PR https://github.com/systemd/systemd/pull/42983, openthread TTL issue https://github.com/openthread/openthread/issues/12083). => DEFAULT_GRACE_MS = 30_000 (matches plan C3.5 example; far below 120 s SRV TTL because Flash peers re-announce at app cadence; long enough to avoid flapping on single missed announcements).
+- (b) StateFlow conflates by equality (https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/) -> discrete Found/Lost events pushed through StateFlow would collapse for slow collectors (Found-then-Lost could vanish). Event log = SharedFlow(replay=0, extraBufferCapacity=256, DROP_OLDEST documented); snapshot = StateFlow rebuilt from directories.
+- (c) Transport priority prior art: AOSP NetworkRanker/NetworkScore policy ranking (https://source.android.com/docs/core/connect/network-selection), NetworkCapabilities transport model (https://developer.android.com/reference/android/net/NetworkCapabilities), Nearby Connections Strategy bandwidth/topology tradeoffs (https://developers.google.com/android/reference/com/google/android/gms/nearby/connection/Strategy), Wi-Fi Aware vs BLE throughput (https://developer.android.com/develop/connectivity/wifi/wifi-aware). => priority LAN > WIFI_DIRECT > WIFI_AWARE > BLE, unknown names last.
+
+### Changed (files created; NO existing file modified)
+- `core/discovery/.../core/StandardEndpointDirectory.kt`: applySeen dedup by deviceId (Found once; Updated only on hostAddress/port/serviceName/friendlyName/proto change; else touch lastSeenAtMs keep firstSeenAtMs + Unchanged); sweepExpired boundary now-lastSeen >= grace (exactly-at-window IS expired); snapshot ordered lastSeenAtMs DESC then deviceId asc.
+- `core/discovery/.../core/TxtCodec.kt`: cross-radio TXT contract keys {device_id,name,model,proto}; decode null when device_id missing/blank or proto unparseable (never throws); trims whitespace; ignores unknown keys.
+- `core/discovery/.../core/DiscoveryRetryPolicy.kt`: attempt->delay doubling base=1000 cap=30000 maxAttempts=5, jitter-free by contract (call sites add jitter); null=give-up; reset() no-op kept for API stability.
+- `core/discovery/.../core/CompositeDiscovery.kt`: implements existing FlashDiscovery + startAll(port,identity) aggregate (Success iff ALL transports advertise+browse OK; failures listed in FlashError.Unknown message); ONE EndpointDirectory per transport; mergedEvents SharedFlow (DROP_OLDEST) + discoveredEndpoints StateFlow rebuilt per diff; cross-transport dedup by deviceId keeping highest-priority endpoint; LOSS HYSTERESIS: losing high-priority sighting while lower still alive emits Updated(fallback), NOT Lost; sweep(nowMs, graceWindowMs=30s default) emits Lost once per aged peer (idempotent); state StateFlow aggregates advertising/browsing flags. stopDiscovery/stopAdvertising emulate partial stop via full stop + transparent restart (radio seam has only stop()).
+- Tests (plain JUnit4, no Robolectric, no coroutines-test): StandardEndpointDirectoryTest, TxtCodecTest, DiscoveryRetryPolicyTest, CompositeDiscoveryTest. Determinism without virtual time: synchronous DirectDispatcher (CoroutineDispatcher dispatching inline) injected via scopeFactory + FakeTransport emitting into controllable MutableSharedFlow; explicit clock lambda drives all timestamps.
+
+### Verification
+- NOT run yet: Gradle execution explicitly forbidden this session ("DO NOT run Gradle"). Code written against read-only contracts (FlashRadioTransport, EndpointDirectory, FlashDiscovery, :core:common types verified by reading sources). Existing files/tests untouched (R4).
+
+### Deviations / decisions worth noting
+- Two extra OPTIONAL constructor params beyond brief signature: scopeFactory + clock (testability without coroutines-test dependency; defaults keep prod behavior). Documented in KDoc.
+- "model" field comparison absent from directory Updated-detection: FlashDiscoveredEndpoint carries no model field (FlashDevice has none); noted in KDoc.
+- startAdvertising(listenPort) without prior identity returns Failure (TXT needs identity from startAll).
+- Lost serviceName: composite captures service names BEFORE sweeper removal so emitted Lost carries it.
+
+### Remaining
+- Gradle testDebugUnitTest pass (expect +~25 tests across 4 new classes).
+- Wire NsdTransport (concurrent agent) into a CompositeDiscovery instance at engine level (C7).
+- Periodic sweeper scheduling caller-side (engine ticker, C7); RetryPolicy wiring inside transports' restart loops is C3.3 impl detail of each radio.
+
+### Next AI
+1) Run consolidated testDebugUnitTest; fix reds, log ERROR-0XX if any. 2) Do not modify these five files without reading this entry. 3) Update handoff.md after verification.
