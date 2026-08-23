@@ -107,10 +107,10 @@
 - None.
 
 ## Last change
-ERROR-013 deep-dive: dedicated-dispatcher fix disproved pool starvation; println on/off flips pass/fail = confirmed Heisenberg timing race in dispatcher worker loop (claim/read/ACK interplay). Tests re-skipped with definitive characterization; fix direction recorded (structured-concurrency rewrite via channels, or coroutines-test virtual time).
+ERROR-013 rewrite attempt REVERTED after findings: structured-concurrency dispatcher fixed symptoms but exposed entangled completion semantics (first-wins terminal guard vs late authoritative frames — racing-ACK regression); dedicated test dispatchers disproved pool starvation; thread dumps show claim/read lock as blocker. Next session: build completion state machine pure-first (PairingSessionStateMachine pattern), then thin executor. Tests remain @Ignore green-skipped.
 
 ## Last test
-testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-23); **636 tests / 0 failures / 6 skipped (ERROR-013 timing-race family, OPEN)**.
+testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-23); **636 tests / 0 failures / 6 skipped** (v1 multistream + @Ignore family retained).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -135,7 +135,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Next: ERROR-013 root-cause (instrumented worker-lifecycle debugging in multistream) OR P5 part 2 - FlashTransferRepository over the new pipelines (C5.2) + SAF receive policy (C5.9) + FGS wiring (C5.12). Owner device run: Dev Console tap-to-connect between two phones now exercises discovery + network + health end-to-end.**
+**Next: ERROR-013 proper fix per logs/errors.md plan — (a) pure CompletionStateMachine test-first, (b) dispatcher as thin executor over it, (c) un-ignore scenarios one by one. Alternative: proceed P5 part 2 (FlashTransferRepository single-stream) while multi-stream design settles. Owner device run: Dev Console tap-to-connect between two phones.**
 
 ## 2026-08-22 - P3 NSD session note (agent handoff)
 - LAN MVP networking now has `nsd/NsdTransport.kt` (:core:discovery) implementing FlashRadioTransport C3.2-C3.4 (identity TXT advertise + self-filter, continuous browse w/ capped restarts, API>=34 ServiceInfoCallback vs <34 hardened NsdResolveQueue split, NetworkRequest-scoped discovery API 33+). `NsdFlashDiscovery` untouched (R4). NOT yet Gradle-verified (forbidden session) - run testDebugUnitTest first; tests: nsd/NsdTransportLogicTest.kt (pure-JVM, no coroutines-test dep in module).

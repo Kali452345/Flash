@@ -31,12 +31,15 @@ After fixes 1-6 above, the six scenarios PASS 3× consecutively when the multist
 - Re-@Ignore'd with updated message ("suite-order flaky: green x3 isolated, red in module/suite runs").
 - Next-session plan: (a) give each scenario its own single-threaded test dispatcher instead of Dispatchers.Default, (b) assert zero leaked workers post-test, or (c) convert parks to proper condition-based shutdown; then un-ignore.
 
-### Update 2026-08-23 (final) — definitive characterization
-Dedicated per-scenario single-thread dispatcher did NOT resolve the failures → shared-pool starvation theory disproven. Adding/removing println probes flips pass/fail → confirmed **Heisenberg timing race inside the dispatcher worker loop** (claim/read/ACK interplay), not environmental or pool contention. Production single-stream paths unaffected; the race only manifests under multi-stream concurrent workers in test conditions (and potentially under real load — treat multi-stream as experimental until fixed).
-**Fix direction for next session:** rewrite `runChannel`/`claimNextChunk` with structured concurrency — replace the ReentrantLock+Condition park/poll loop with kotlinx channels (`Channel` for work distribution, `select`/`joinAll` for lifecycle) which eliminates manual signaling entirely, then un-ignore tests. Alternatively migrate tests to kotlinx-coroutines-test virtual time to make the race deterministic and debuggable.
+### Update 2026-08-23 (rewrite attempt — reverted, findings preserved)
+A full structured-concurrency rewrite of `MultiStreamDispatcher` (channels + materializer coroutine + per-channel workers + liveness watcher + completion grace window) was attempted and **reverted**. Findings that survive the revert:
+1. The rewrite fixed the original five scenarios' *symptoms* in some runs but exposed a deeper SEMANTIC issue: session resolution, COMPLETE-frame emission, and late inbound ingestion are entangled. Specifically, a first-wins terminal guard (required for exactly-once COMPLETE) silently drops later-arriving authoritative frames — but the racing-ACK contract requires late ingestion to still upgrade/emit. v1 passed its racing-ACK test only because it had NO guard; any correct guard needs new completion semantics (e.g., separate "resolution" from "COMPLETE emission", or an explicit state machine: Coverage → AwaitingComplete → Resolved with allowed transitions).
+2. Dedicated single-thread/fixed-pool test dispatchers do NOT fix the zero-send timeouts → not pool starvation.
+3. Thread dumps at timeout show our runChannel coroutines never reach sendFrame even when alive/dispatched — blocker is inside claim/read under the state lock, or a missed condition signal; needs lock-order instrumentation (`println` perturbation flips outcomes = true Heisenbug).
+4. Next-session plan (concrete): (a) write the completion state machine FIRST as a pure, single-threaded, deterministically-testable class (like PairingSessionStateMachine was for pairing); (b) make the dispatcher a thin executor over it; (c) port tests one at a time. Do NOT attempt another incremental patch of the current loop.
 
 ### Status
-OPEN (scope narrowed: one worker-loop timing race; single-stream transfer fully green)
+OPEN (v1 loop + @Ignore'd scenarios retained as last-known-green; rewrite approach validated as necessary-but-insufficient without the state-machine redesign)
 
 ## ERROR-012 - PowerShell 5.1 Get-Content/Set-Content corrupts UTF-8 repo files (mojibake)
 
