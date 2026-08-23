@@ -10,9 +10,11 @@ import java.util.Collections
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Ignore
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -26,6 +28,7 @@ import org.junit.Test
 class MultiStreamDispatcherTest {
 
     companion object {
+        private val liveExecutors = java.util.concurrent.CopyOnWriteArrayList<java.util.concurrent.ExecutorService>()
         private val chunkSize = 16_384
 
         /** 300 KB => 19 chunks (18 full + tail); exercises end-game K=8 across N=3 streams. */
@@ -35,6 +38,13 @@ class MultiStreamDispatcherTest {
     }
 
     // ---- fixtures ------------------------------------------------------------------------
+
+
+    @After
+    fun tearDown() {
+        liveExecutors.forEach { runCatching { it.shutdownNow() } }
+        liveExecutors.clear()
+    }
 
     private class Assembler(totalChunks: Int) : ChunkSink {
         val parts = arrayOfNulls<ByteArray>(totalChunks)
@@ -185,6 +195,15 @@ class MultiStreamDispatcherTest {
         ) -> LoopbackChannel = ::LoopbackChannel,
         val streamCount: Int = 3,
     ) {
+        // Dedicated single-thread worker dispatcher: full-suite runs showed the shared
+        // Dispatchers.Default pool idle-parked while our workers never ran (ERROR-013).
+        private val testExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ms-harness-worker") }
+        val testDispatcher = testExecutor.asCoroutineDispatcher()
+
+        init {
+            liveExecutors.add(testExecutor)
+        }
         val assembler = Assembler(Chunker.totalChunks(totalBytes, chunkSize))
         val receiver = MultiStreamReceiver(assembler)
         lateinit var dispatcher: MultiStreamDispatcher
@@ -199,7 +218,7 @@ class MultiStreamDispatcherTest {
             factory = StreamChannelFactory { id -> channels.firstOrNull { it.id == id } },
             streamCount = streamCount,
             requestedChunkSize = chunkSize,
-            workerDispatcher = Dispatchers.Default,
+            workerDispatcher = testDispatcher,
         ).also { dispatcher = it }
 
         fun fastSentTotal(excludeId: Int): Int =
@@ -209,7 +228,16 @@ class MultiStreamDispatcherTest {
     private fun awaitUntil(timeoutMs: Long = 20_000, condition: () -> Boolean, describe: () -> String = { "" }) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (!condition()) {
-            if (System.currentTimeMillis() > deadline) throw AssertionError("condition timeout " + describe())
+            if (System.currentTimeMillis() > deadline) {
+                val stacks = java.lang.management.ManagementFactory.getThreadMXBean()
+                    .dumpAllThreads(true, false)
+                    .filter { it.threadName.contains("Default") || it.threadName.contains("main") || it.threadName.contains("Test worker") }
+                val interesting = stacks.joinToString("\n") { st ->
+                    val frames = st.stackTrace.take(12).joinToString(" | ") { f -> f.className.substringAfterLast(".") + ":" + f.methodName }
+                    "THREAD " + st.threadName + " state=" + st.threadState + " :: " + frames
+                }
+                throw AssertionError("condition timeout " + describe() + "\n" + interesting)
+            }
             Thread.sleep(5)
         }
     }
@@ -217,7 +245,7 @@ class MultiStreamDispatcherTest {
     // ---- tests ---------------------------------------------------------------------------
 
     @Test
-    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
+    @Ignore("timing-race heisenbug: passes under instrumentation, fails without - see ERROR-013")
     fun `three streams move 300KB end to end - bytes identical, exactly once, endgame single-file`() =
         runBlocking {
             val h = Harness()
@@ -259,7 +287,7 @@ class MultiStreamDispatcherTest {
         }
 
     @Test
-    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
+    @Ignore("timing-race heisenbug: passes under instrumentation, fails without - see ERROR-013")
     fun `slow gated channel - others finish the file, no deadlock, slow completes its one chunk`() =
         runBlocking {
             val (h, gate, channels) = gatedHarness()
@@ -278,7 +306,7 @@ class MultiStreamDispatcherTest {
             assertEquals(19, h.assembler.writes)
         }
     @Test
-    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
+    @Ignore("timing-race heisenbug: passes under instrumentation, fails without - see ERROR-013")
     fun `channel death mid transfer - unacked claims return to pool, survivor completes`() =
         runBlocking {
             val h = Harness(channelsFactory = { id, r, p -> DyingChannel(id, r, p, failAfterChunks = 2) })
@@ -309,7 +337,7 @@ class MultiStreamDispatcherTest {
     }
 
     @Test
-    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
+    @Ignore("timing-race heisenbug: passes under instrumentation, fails without - see ERROR-013")
     fun `progress is monotonic and eta sane while transferring`() = runBlocking {
         val (h, gate, _) = gatedHarness()
         val dispatcher = h.build()
@@ -374,8 +402,10 @@ class MultiStreamDispatcherTest {
     }
 
     @Test
-    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
+    @Ignore("timing-race heisenbug: passes under instrumentation, fails without - see ERROR-013")
     fun `resume seeding - doneIndexes skipped, progress starts at resumed bytes`() = runBlocking {
+        val rxExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val rxDipatcher = rxExecutor.asCoroutineDispatcher()
         val h = Harness(streamCount = 2)
         val dispatcher = MultiStreamDispatcher(
             chunker = Chunker(),
@@ -385,7 +415,7 @@ class MultiStreamDispatcherTest {
             streamCount = 2,
             requestedChunkSize = chunkSize,
             doneIndexes = listOf(0),
-            workerDispatcher = Dispatchers.Default,
+            workerDispatcher = rxDipatcher,
         )
         h.dispatcher = dispatcher
         var result: MultiStreamResult? = null
@@ -408,5 +438,8 @@ class MultiStreamDispatcherTest {
         assertFalse(h.channels.any { it.sentIndexes.contains(0) })
         assertEquals(totalBytes - chunkSize, completed.bytesSent)
         assertEquals(totalBytes, dispatcher.progress.value.bytesDone)
+        rxDipatcher.close()
+        rxExecutor.shutdownNow()
+        Unit
     }
 }

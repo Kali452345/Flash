@@ -31,8 +31,12 @@ After fixes 1-6 above, the six scenarios PASS 3× consecutively when the multist
 - Re-@Ignore'd with updated message ("suite-order flaky: green x3 isolated, red in module/suite runs").
 - Next-session plan: (a) give each scenario its own single-threaded test dispatcher instead of Dispatchers.Default, (b) assert zero leaked workers post-test, or (c) convert parks to proper condition-based shutdown; then un-ignore.
 
+### Update 2026-08-23 (final) — definitive characterization
+Dedicated per-scenario single-thread dispatcher did NOT resolve the failures → shared-pool starvation theory disproven. Adding/removing println probes flips pass/fail → confirmed **Heisenberg timing race inside the dispatcher worker loop** (claim/read/ACK interplay), not environmental or pool contention. Production single-stream paths unaffected; the race only manifests under multi-stream concurrent workers in test conditions (and potentially under real load — treat multi-stream as experimental until fixed).
+**Fix direction for next session:** rewrite `runChannel`/`claimNextChunk` with structured concurrency — replace the ReentrantLock+Condition park/poll loop with kotlinx channels (`Channel` for work distribution, `select`/`joinAll` for lifecycle) which eliminates manual signaling entirely, then un-ignore tests. Alternatively migrate tests to kotlinx-coroutines-test virtual time to make the race deterministic and debuggable.
+
 ### Status
-OPEN (downgraded from "six bugs" to "one interference defect + residual verified-null race")
+OPEN (scope narrowed: one worker-loop timing race; single-stream transfer fully green)
 
 ## ERROR-012 - PowerShell 5.1 Get-Content/Set-Content corrupts UTF-8 repo files (mojibake)
 

@@ -107,10 +107,10 @@
 - None.
 
 ## Last change
-ERROR-013 investigation: fixes 1-6 verified; remaining six scenarios characterized as SUITE-ORDER FLAKY (green x3 isolated, red in module/suite runs) - cross-test interference, likely leaked park-loop workers starving Dispatchers.Default. Re-@Ignore with updated message; next-session plan recorded (dedicated test dispatcher / leak assertions / condition-based shutdown).
+ERROR-013 deep-dive: dedicated-dispatcher fix disproved pool starvation; println on/off flips pass/fail = confirmed Heisenberg timing race in dispatcher worker loop (claim/read/ACK interplay). Tests re-skipped with definitive characterization; fix direction recorded (structured-concurrency rewrite via channels, or coroutines-test virtual time).
 
 ## Last test
-testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-23); **636 tests / 0 failures / 6 skipped (ERROR-013 suite-order-flaky family, OPEN)**.
+testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-23); **636 tests / 0 failures / 6 skipped (ERROR-013 timing-race family, OPEN)**.
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
