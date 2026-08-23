@@ -61,7 +61,7 @@ class DefaultFlashNetwork(
         },
     /** Test seam: outbound transport when no Android context is available. */
     private val probeOverride: LanConnectionProbe? = null,
-) : FlashNetwork {
+) : FlashNetwork, com.transfer.flash.core.network.bridge.EndpointMemory {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val running = AtomicBoolean(false)
@@ -148,7 +148,7 @@ class DefaultFlashNetwork(
     // ------------------------------------------------------------------
 
     /** Records a connectable route for a peer (called by discovery consumers). */
-    fun rememberEndpoint(deviceId: String, host: String, port: Int) {
+    override fun rememberEndpoint(deviceId: String, host: String, port: Int) {
         synchronized(lock) { knownEndpoints[deviceId] = Endpoint(host, port, 0L) }
     }
 

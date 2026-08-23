@@ -61,6 +61,16 @@ fun FlashDevConsoleScreen(
         kotlinx.coroutines.flow.MutableStateFlow(FlashDiscoveryState())
     }
     val status by (engine?.state ?: statusFallback).collectAsState()
+    val networkFallbackState = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(com.transfer.flash.core.network.FlashNetworkState())
+    }
+    val networkFallbackHealth = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(com.transfer.flash.core.network.FlashConnectionHealth.Offline)
+    }
+    val currentNetwork = DiscoveryEngineHolder.currentNetwork()
+    val networkState by (currentNetwork?.networkState ?: networkFallbackState).collectAsState()
+    val health by (currentNetwork?.connectionHealth ?: networkFallbackHealth).collectAsState()
+    var connectLog by remember { mutableStateOf("") }
 
     fun start() {
         scope.launch {
@@ -146,12 +156,19 @@ fun FlashDevConsoleScreen(
             }
 
             FlashText(
-                "Status: ${status.statusMessage}",
+                "Status: ${status.statusMessage} · Network: ${health.name} (peers ${networkState.activePeerCount})",
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(top = 16.dp),
             )
+            if (connectLog.isNotEmpty()) {
+                FlashText(
+                    connectLog,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
             FlashText(
-                "Endpoints (${endpoints.size})",
+                "Endpoints (${endpoints.size}) — tap to connect",
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(top = 8.dp),
             )
@@ -165,6 +182,24 @@ fun FlashDevConsoleScreen(
                                 MaterialTheme.colorScheme.surfaceVariant,
                                 RoundedCornerShape(8.dp),
                             )
+                            .clickable {
+                                val net = DiscoveryEngineHolder.currentNetwork() ?: return@clickable
+                                scope.launch {
+                                    val result = net.connect(
+                                        com.transfer.flash.core.common.model.FlashDevice(
+                                            id = ep.deviceId,
+                                            friendlyName = ep.friendlyName,
+                                            transportType = ep.transportType,
+                                        ),
+                                    )
+                                    connectLog = when (result) {
+                                        is com.transfer.flash.core.common.result.FlashResult.Success ->
+                                            "Connected to ${ep.friendlyName}"
+                                        is com.transfer.flash.core.common.result.FlashResult.Failure ->
+                                            "Connect failed: ${result.error}"
+                                    }
+                                }
+                            }
                             .padding(10.dp),
                     ) {
                         FlashText(ep.friendlyName, style = MaterialTheme.typography.titleSmall)

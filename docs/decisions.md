@@ -1,4 +1,46 @@
-# Decisions
+﻿# Decisions
+
+## ADR-015 - Multi-stream dispatch: dynamic claim loop (MPSCP-style), first-free end-game tail, one shared ACK mirror answered per arrival channel (C5.7)
+
+### Decision
+1. **Work distribution = dynamic on-demand claiming**, not static range/round-robin partitioning: each idle channel worker claims the next unsent chunk from a shared cursor (+ retry pool of chunks returned by dead channels). End-game: when remaining work <= K=8 chunks, the FIRST free alive channel becomes sole owner and drains the tail one chunk at a time; others park and take over only if the owner dies.
+2. **One shared sender-side confirmed mirror** (`ResumeBitVector`, monotonic-union) guarded by a single state lock - never per-channel vectors, because receiver ACK batches may arrive on ANY of the N channels. Dedup: already-marked indexes are never re-counted; duplicate/overlapping batches idempotent.
+3. **Receiver replies (ACK_BATCH/COMPLETE) travel down the ARRIVING channel** (liveness symmetry, per-path congestion honesty, no routing table). Terminal COMPLETE coordination frame is emitted EXACTLY ONCE by whichever thread first observes full coverage (CAS).
+4. Stream count configurable 1..4, default 2 (plan C5.7); defaults stay provisional until EXP benchmarks on physical devices.
+
+### Context
+LocalSend v2 parallelizes only across FILES (`POST /upload` per fileId, called in parallel - https://github.com/localsend/protocol §4.2); within-one-file striping needs GridFTP/PFTP/MPSCP prior art (https://www.osti.gov/servlets/purl/1143126): PFTP's static round-robin lets a slow stream head-of-line block its whole share, while MPSCP's "next block to the first available stream" naturally load-balances. BitTorrent keeps end-game request depth minimal so the tail cannot strand behind slow peers (https://blog.libtorrent.org/2011/11/writing-a-fast-piece-picker/). Aggregate throughput is computed as ONE rolling 2 s window over TOTAL confirmed bytes (never summed per-stream rates).
+
+### Alternatives considered
+- Static range partitioning per stream: rejected - head-of-line blocking on slow streams, measured worse in PDT studies above.
+- Round-robin pre-assignment: rejected - same slow-stream pathology without death-reclaim flexibility.
+- Per-channel confirmed vectors merged later: rejected - fragmented truth; late/duplicate ACKs across channels become ambiguous.
+- Broadcasting every ACK batch to all N channels: rejected - wasted writes and double-count risk; arrival-channel reply + any-channel ingestion is sufficient.
+- Spreading the last K chunks across all channels (BitTorrent duplicate-request style): rejected for SENDER-side dispatch - duplicates waste upload bytes; single-owner tail gives deterministic drain with owner-failover.
+
+### Revisit when
+EXP-0XX device benchmarks (1 vs 2 vs 4 streams) land; K=8 and default streamCount may be retuned. Pause/cancel and stall timeouts are engine-layer concerns around `MultiStreamDispatcher.send`.
+
+## ADR-014 - Chunked transfer framing v2: self-contained binary frames, per-chunk SHA-256 verify-before-write, monotonic-union resume vectors (C5.3-C5.6)
+
+### Decision
+1. Framing v2 is a **self-contained binary format** (FLSH magic + version byte 2 + type byte + u32 LE payload length; LE scalars; u16-length-prefixed UTF-8 strings), documented in full in ChunkFrame.kt KDoc and traveling as FlashEnvelope payloads. Types: FILE_START{transferId,fileId,fileName,totalBytes,totalChunks,chunkSize,fileSha256Hex} / CHUNK{transferId,fileId,index,data,chunkSha256raw32} / ACK_BATCH{transferId,fileId,indexes asc} / COMPLETE{transferId,fileId,verified}.
+2. Per-chunk SHA-256 carried **raw 32 B** (not hex); receiver verifies BEFORE sink write (C5.5). Mismatch = Rejected(HASH_MISMATCH), never written/marked/ACKed - absence from ACK batches is the implicit NACK driving targeted single-chunk repair.
+3. Resume state is a BitSet-packed bit vector (ResumeBitVector: wordCount LE + LE words) with **monotonic-union** 
+econcile merge rule on both receiver and sender mirrors.
+4. ACK batching fixed at every 32 distinct verified chunks (ReceivePipeline.DEFAULT_ACK_EVERY); COMPLETE emitted only when the vector completes, optionally gated by an injected whole-file digest re-check.
+
+### Context
+LocalSend v2 supplies file-level sha256 at prepare-upload and answers 422 on mismatch; BitTorrent pins piece-level independent hashes so corruption localizes to one re-requestable unit and resume state is a grow-only bitfield. Binary framing chosen because CHUNK carries up to 256 KB opaque bytes - JSON/base64 would inflate wire volume ~33%+ per chunk.
+
+### Alternatives considered
+- Single running whole-file digest only: rejected - cannot localize corruption or validate partial resume state without a second pass.
+- Hex-encoded per-chunk hashes: rejected - doubles hash overhead (64 B vs 32 B) per chunk.
+- Sequence-number-only ACKs (cumulative): rejected - cannot express holes for out-of-order/multi-stream arrival (C5.7).
+- Sender-side random-access seek on resume: deferred - linear read-and-discard skip kept for v1 (flash read >> LAN throughput); SeekableSource reserved.
+
+### Revisit when
+Rust/desktop client implements the layout (compat test vectors then mandatory), or C5.7 multi-stream needs windowed/selective ACK semantics beyond the batch set.
 
 ## ADR-012 - CompositeDiscovery cross-radio dedup priority + presence grace window (P3/C3.9)
 
@@ -30,7 +72,7 @@ Owner approved (2026-08-22):
 - Phase P0 executed same session: `FlashProtocol`/`FlashEnvelope`, `FlashLogger` ring buffer, `FlashTimeSource`/`FlashIdGenerator` (:core:common), Hilt graph skeleton + `FlashApplication`, GitHub Actions CI (C0.6), UI-040 sound system (`FlashSounds`) implemented in :ui:theme.
 
 ### Context
-Hilt chosen over Koin (compile-time safety, standard tooling) and manual DI (brittle at scale); verified compatible with AGP 9.3.1/Kotlin 2.2.10 via research (Dagger ≥2.59 requires AGP ≥9 — satisfied). Sounds chosen opt-in/off to match reduce-motion philosophy (motion/a11y-first app) until owner opts in.
+Hilt chosen over Koin (compile-time safety, standard tooling) and manual DI (brittle at scale); verified compatible with AGP 9.3.1/Kotlin 2.2.10 via research (Dagger â‰¥2.59 requires AGP â‰¥9 â€” satisfied). Sounds chosen opt-in/off to match reduce-motion philosophy (motion/a11y-first app) until owner opts in.
 
 ### Alternatives considered
 Koin (runtime-only error detection), manual AppContainer (fine now, brittle later); asset-based sounds (ships binaries for what synthesis covers), default-on tones (rejected by a11y philosophy).
@@ -44,7 +86,7 @@ Capability-flag version negotiation if a second protocol consumer appears (Windo
 Owner approved (2026-08-22) during the core-plan iteration session:
 - **D2:** SQLCipher full-database at-rest encryption, key wrapped in AndroidKeyStore.
 - **D3:** SHA-256 (java.security, zero deps) for chunk/message hashes and fingerprints.
-- **D4:** Frame-level E2E implemented in C2 — ECDH P-256 → HKDF → AES-GCM per paired peer, layered on TLS.
+- **D4:** Frame-level E2E implemented in C2 â€” ECDH P-256 â†’ HKDF â†’ AES-GCM per paired peer, layered on TLS.
 - **D5:** Mesh relay is post-v1; v1 = direct P2P only (hop-count seams reserved).
 - Plan `docs/core-upgrade-plan.md` rewritten to **v2**: fine-grained research-first steps, UI-dependency inventory, continuous identity-aware discovery, resilient network upgrades, multi-stream transfer, exhaustive messaging API surface.
 
@@ -52,7 +94,7 @@ Owner approved (2026-08-22) during the core-plan iteration session:
 UI roadmap complete on sample data; the finished screens define exact required inputs (`isVerified`, presence, typing names, transfer telemetry, pairing events). Core must be a reusable library (no app/UI deps) and every implementation step must begin with cited web research.
 
 ### Alternatives considered
-Keystore-wrapped field encryption only (rejected — weaker than owner-approved full-database option); BLAKE3 (deferred — zero-dep SHA-256 sufficient until benchmarks say otherwise); mesh relay in v1 (rejected — scope).
+Keystore-wrapped field encryption only (rejected â€” weaker than owner-approved full-database option); BLAKE3 (deferred â€” zero-dep SHA-256 sufficient until benchmarks say otherwise); mesh relay in v1 (rejected â€” scope).
 
 ### Revisit when
 D1 (Hilt vs Koin vs manual) still needs explicit sign-off before C0.5; D6 (sound feedback) blocks UI-040. Benchmarks may revisit hash choice after EXP entries exist.
@@ -75,7 +117,7 @@ AGENTS.md 34 requires M3 as infrastructure only and every visible identity eleme
 - Pre-existing Material usages flagged for later cleanup: material3.IconButton in FlashReplyDock, CircularProgressIndicator in FlashFileIconBadge (both predate this ADR), HorizontalDivider, Scaffold.
 
 
-## ADR-008 — Modular Multi-Library Architecture & Standalone Component Hosting
+## ADR-008 â€” Modular Multi-Library Architecture & Standalone Component Hosting
 
 ### Decision
 Transition the Flash codebase from a single `:app` monolithic module into a suite of decoupled, standalone Android/Kotlin library modules (`:core:common`, `:core:discovery`, `:core:network`, `:core:transfer`, `:ui:theme`, `:ui:chat`, `:ui:transfer`) with `:app` serving as the runnable showcase application. Each library module will be independently buildable, testable, and publishable to Maven repositories via the Gradle `maven-publish` plugin under the group `com.transfer.flash`.
@@ -86,9 +128,9 @@ The owner requested that Flash's components be usable individually by third-part
 - UI components (Flash Pulse design system tokens, custom icons, message bubbles, chat list, composer) can be consumed independently with pluggable backend repositories.
 
 ### Alternatives considered
-- Single-module architecture with package-level separation — rejected (cannot publish individual artifacts; risks accidental coupling between UI and low-level networking).
-- Monolithic single SDK library (`flash-sdk`) — rejected (forces UI consumers to pull in networking/sockets, and forces headless users to pull in Compose runtime).
-- Fine-grained multi-module library suite (`:core:*`, `:ui:*`, `:app`) — selected.
+- Single-module architecture with package-level separation â€” rejected (cannot publish individual artifacts; risks accidental coupling between UI and low-level networking).
+- Monolithic single SDK library (`flash-sdk`) â€” rejected (forces UI consumers to pull in networking/sockets, and forces headless users to pull in Compose runtime).
+- Fine-grained multi-module library suite (`:core:*`, `:ui:*`, `:app`) â€” selected.
 
 ### Why this was selected
 - **Independent Consumption**: Developers can pull `com.transfer.flash:core-transfer` for headless file transfer or `com.transfer.flash:ui-chat` for custom messaging UI.
@@ -101,22 +143,22 @@ When preparing the first public Maven release or when extracting pure JVM/KMP mo
 
 ---
 
-## ADR-007 — Experimental WebSocket transfer side track (hand-rolled RFC 6455, multi-peer)
+## ADR-007 â€” Experimental WebSocket transfer side track (hand-rolled RFC 6455, multi-peer)
 
 ### Decision
 An experimental WebSocket-based transfer path lives in `wstransfer/` (`WebSocketCodec`, `WsConnection`, `WsTransferServer`, `WsTransferClient`, `WsTransferManager`) plus `ui/transfer/WsTransferScreen.kt`. It is a **side track at the owner's request** and does NOT replace the main LAN/TCP+TLS protocol plan. The RFC 6455 codec (upgrade handshake, masking, frame parse/serialize, fragmentation reassembly) is hand-rolled in pure Kotlin; no new Gradle dependency was added.
 
 ### Context
-The owner asked for WebSocket-based transfer that lets 3+ devices pair and connect to each other with simple file transfer, explicitly "not part of our main design". OkHttp 4.12.0 exists in the Gradle cache only as a leftover of the reverted Stream SDK experiment, and OkHttp's WebSocket is client-only — every Flash device must be both server and client, so OkHttp alone could not satisfy the requirement.
+The owner asked for WebSocket-based transfer that lets 3+ devices pair and connect to each other with simple file transfer, explicitly "not part of our main design". OkHttp 4.12.0 exists in the Gradle cache only as a leftover of the reverted Stream SDK experiment, and OkHttp's WebSocket is client-only â€” every Flash device must be both server and client, so OkHttp alone could not satisfy the requirement.
 
 ### Alternatives considered
-- OkHttp WebSocket client + separate WS server library — rejected (two dependencies, client/server split, and OkHttp has no server).
-- `org.java_websocket` (TooTallNate) — rejected for now (new dependency; keep zero-dep until this track proves useful).
-- Extend line-based `LanSession` — rejected (owner explicitly requested WebSocket framing).
+- OkHttp WebSocket client + separate WS server library â€” rejected (two dependencies, client/server split, and OkHttp has no server).
+- `org.java_websocket` (TooTallNate) â€” rejected for now (new dependency; keep zero-dep until this track proves useful).
+- Extend line-based `LanSession` â€” rejected (owner explicitly requested WebSocket framing).
 
 ### Why this was selected
 - Zero new dependencies (AGENTS.md dependency rule); codec is pure JVM and unit-tested (RFC 6455 reference accept-key vector, masked/unmasked round trips, 16/64-bit lengths, fragmentation, close/ping).
-- Server (port 45822 preferred) + client on every device → any device can pair with any number of peers; peers keyed by device ID with outbound-preferred primary connection and inbound fallback, so a 3-device full mesh works.
+- Server (port 45822 preferred) + client on every device â†’ any device can pair with any number of peers; peers keyed by device ID with outbound-preferred primary connection and inbound fallback, so a 3-device full mesh works.
 - File bytes ride ordered binary frames between `FLASH_FILE_START` / `FLASH_FILE_END` text frames; receiver writes to `filesDir/ws-received/` and answers `FLASH_FILE_ACK` with byte-count verification.
 
 ### Revisit when
@@ -124,18 +166,18 @@ If this track graduates to the main design: add TLS (wss://), real pairing/trust
 
 ---
 
-## ADR-006 — Custom `FlashBubbleShape` concave tail geometry (UI-005)
+## ADR-006 â€” Custom `FlashBubbleShape` concave tail geometry (UI-005)
 
 ### Decision
-Message bubbles use a Flash-owned `Shape` (`FlashBubbleShape` in `ui/theme/FlashShapes.kt`) producing `Outline.Generic(Path)`: three circular corners plus one concave cubic-Bézier "pulse scoop" (8dp) on the sender-facing bottom corner, mirrored in RTL via `LayoutDirection`. Grouped messages (`TOP`/`MIDDLE`) are fully rounded 20dp. No third-party bubble library.
+Message bubbles use a Flash-owned `Shape` (`FlashBubbleShape` in `ui/theme/FlashShapes.kt`) producing `Outline.Generic(Path)`: three circular corners plus one concave cubic-BÃ©zier "pulse scoop" (8dp) on the sender-facing bottom corner, mirrored in RTL via `LayoutDirection`. Grouped messages (`TOP`/`MIDDLE`) are fully rounded 20dp. No third-party bubble library.
 
 ### Context
 The master plan forbids generic `RoundedCornerShape` rectangles as final bubbles, and the provisional zero-radius-corner tail read as a broken rectangle. UI-005 required real grouped geometry with a distinct silhouette.
 
 ### Alternatives considered
-- Zero-radius corner tail (provisional) — rejected (accidental look).
-- SmartToolFactory/Compose-Bubble library — rejected (dependency for one path, canvas-shadow style conflicts with Flash no-shadow policy).
-- `graphics-shapes` morphing — rejected for now; revisit only if UI-006 research justifies it.
+- Zero-radius corner tail (provisional) â€” rejected (accidental look).
+- SmartToolFactory/Compose-Bubble library â€” rejected (dependency for one path, canvas-shadow style conflicts with Flash no-shadow policy).
+- `graphics-shapes` morphing â€” rejected for now; revisit only if UI-006 research justifies it.
 
 ### Why this was selected
 Zero new dependencies; clips/borders follow the path; RTL-correct; one path per measure; gives Flash a silhouette detail not used by reference apps.
@@ -145,18 +187,18 @@ UI-006 insertion animation research or UI-045 quality gate suggests morphing sha
 
 ---
 
-## ADR-005 — Flash Pulse visual identity (UI-001)
+## ADR-005 â€” Flash Pulse visual identity (UI-001)
 
 ### Decision
-Flash premium chat UI uses the **Flash Pulse** design system: teal pulse accent (`#0D9488` light / `#1FB8A6` dark), graphite neutrals, spark amber for transfer/status only, layered dark surfaces (void + surface0–3). Tokens live in `ui/theme/`. Chat UI must not use `MaterialTheme.colorScheme` for visible styling.
+Flash premium chat UI uses the **Flash Pulse** design system: teal pulse accent (`#0D9488` light / `#1FB8A6` dark), graphite neutrals, spark amber for transfer/status only, layered dark surfaces (void + surface0â€“3). Tokens live in `ui/theme/`. Chat UI must not use `MaterialTheme.colorScheme` for visible styling.
 
 ### Context
 UI-001 research compared Material You-as-primary, Stream-look scaffold (ADR-003 era), and an original palette. Owner requires distinct identity per ADR-004.
 
 ### Alternatives considered
-- Material dynamic color as primary — rejected (brand loss).
-- Retain Stream-look `#005FFF` blue — rejected (clone risk, wrong P2P story).
-- Flash Pulse teal + graphite — selected.
+- Material dynamic color as primary â€” rejected (brand loss).
+- Retain Stream-look `#005FFF` blue â€” rejected (clone risk, wrong P2P story).
+- Flash Pulse teal + graphite â€” selected.
 
 ### Why this was selected
 Distinct from major messaging apps; supports local/P2P semantics; documented light + dark palettes; optional `dynamicAccent` tints accent only (UI-036 foundation).
@@ -166,7 +208,7 @@ UI-045 quality gate or owner requests rebrand; UI-036 adds user-facing dynamic a
 
 ---
 
-## ADR-004 — Premium chat UI: research-first, custom Flash design system
+## ADR-004 â€” Premium chat UI: research-first, custom Flash design system
 
 ### Decision
 Flash premium messaging UI will be built component-by-component using a **research-first** workflow documented in `docs/ui/`. Material 3 is infrastructure only; the visible chat experience must use Flash-owned design, motion, icons, and interactions. No proprietary chat SDK/source (Stream etc.).
@@ -175,33 +217,33 @@ Flash premium messaging UI will be built component-by-component using a **resear
 The product requires Telegram/Signal/WhatsApp-level polish with Flash's own visual identity and P2P-aware UX. Prior exploratory conversation UI exists but is provisional and must not bypass per-component research.
 
 ### Alternatives considered
-- Continue Stream-look clean-room scaffold as final UI — rejected (does not meet originality/premium component bar).
-- Copy Telegram/Stream visuals — rejected (legal and product identity).
-- Single-pass Material 3 chat screen — rejected (generic, not premium).
-- Research-first custom system with documented UI-001–UI-045 sequence — selected.
+- Continue Stream-look clean-room scaffold as final UI â€” rejected (does not meet originality/premium component bar).
+- Copy Telegram/Stream visuals â€” rejected (legal and product identity).
+- Single-pass Material 3 chat screen â€” rejected (generic, not premium).
+- Research-first custom system with documented UI-001â€“UI-045 sequence â€” selected.
 
 ### Why this was selected
 - Matches owner requirement for documented research per component.
 - Keeps networking independent of UI.
-- Enables continuity across AI sessions via `docs/ui/` and AGENTS.md §34.
+- Enables continuity across AI sessions via `docs/ui/` and AGENTS.md Â§34.
 
 ### Revisit when
 UI-045 quality gate passes and owner accepts premium chat UI for release; or if a licensed third-party UI kit is explicitly approved in writing.
 
-## ADR-003 — Clean-room Stream visual parity; no Stream SDK or source incorporation
+## ADR-003 â€” Clean-room Stream visual parity; no Stream SDK or source incorporation
 
 ### Decision
 Flash chat UI will match Stream Chat Android's premium conversation appearance through a Flash-owned design system and clean-room Compose components. Flash will **not** copy Stream source code, vendor Stream modules, or depend on Stream Maven artifacts.
 
 ### Context
-The reference repo at `E:\Flash-reference-repos\stream-chat-android` is publicly visible but licensed under Stream.io's proprietary **Stream License**, not Apache/MIT. That license requires a Stream customer relationship, forbids sublicensing or distributing Stream source, and explicitly prohibits using Stream software to develop products that compete with Stream Chat (Section 6). Flash is a P2P LAN/Wi‑Fi Direct chat product and therefore falls under the competitive-use restriction.
+The reference repo at `E:\Flash-reference-repos\stream-chat-android` is publicly visible but licensed under Stream.io's proprietary **Stream License**, not Apache/MIT. That license requires a Stream customer relationship, forbids sublicensing or distributing Stream source, and explicitly prohibits using Stream software to develop products that compete with Stream Chat (Section 6). Flash is a P2P LAN/Wiâ€‘Fi Direct chat product and therefore falls under the competitive-use restriction.
 
 ### Alternatives considered
-- Copy `stream-chat-android-compose` sources into Flash and adapt models — rejected (license + competitive-use).
-- Add `io.getstream:stream-chat-android-compose` as a Gradle dependency — rejected (same license on published artifacts).
-- Use Stream SDK with a Flash network adapter — rejected unless Stream grants a written competitive carve-out.
-- Generic Material 3 dynamic theming — rejected (does not match Stream's fixed brand/chrome design system).
-- Clean-room UI with side-by-side visual verification against the compose sample — selected.
+- Copy `stream-chat-android-compose` sources into Flash and adapt models â€” rejected (license + competitive-use).
+- Add `io.getstream:stream-chat-android-compose` as a Gradle dependency â€” rejected (same license on published artifacts).
+- Use Stream SDK with a Flash network adapter â€” rejected unless Stream grants a written competitive carve-out.
+- Generic Material 3 dynamic theming â€” rejected (does not match Stream's fixed brand/chrome design system).
+- Clean-room UI with side-by-side visual verification against the compose sample â€” selected.
 
 ### Why this was selected
 - Keeps Flash legally independent while still targeting Stream-level visual polish.
@@ -274,3 +316,4 @@ Plan P3.5 workstream A (identity hardening) + B2/B3 (mode wiring); contracts Fla
 
 ### Revisit when
 Multiple transports implement modes (fan-out semantics may need per-transport acks), or when pairing lands (fp8 becomes a pinning cross-check at C3.10, not just a hint).
+

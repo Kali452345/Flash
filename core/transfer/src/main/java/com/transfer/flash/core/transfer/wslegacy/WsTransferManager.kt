@@ -1,6 +1,6 @@
 @file:OptIn(FlashInternalApi::class)
 
-package com.transfer.flash.wstransfer
+package com.transfer.flash.core.transfer.wslegacy
 
 import android.content.Context
 import com.transfer.flash.core.common.annotation.FlashInternalApi
@@ -8,13 +8,12 @@ import android.net.Uri
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
-import com.transfer.flash.identity.AppIdentity
-import com.transfer.flash.model.DiscoveredDevice
 import com.transfer.flash.core.network.util.LocalNetworkAddresses
 import com.transfer.flash.core.network.ws.WebSocketCodec
 import com.transfer.flash.core.network.ws.WsConnection
 import com.transfer.flash.core.network.ws.WsTransferClient
 import com.transfer.flash.core.network.ws.WsTransferServer
+import com.transfer.flash.core.security.trust.AndroidPreferencesTrustStore
 import com.transfer.flash.core.transfer.protocol.WsTransferMessages
 import com.transfer.flash.core.transfer.model.WsDiscoveredDevice
 import com.transfer.flash.core.transfer.model.WsPeer
@@ -36,6 +35,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /**
+ * LEGACY relocation (C5.1): pre-chunked whole-file 64KiB-frame engine retained as
+ * fallback/reference; superseded by transfer.chunked pipelines (C5.3+) — scheduled for
+ * deletion after parity.
+ *
  * Experimental WebSocket transfer orchestrator (side track, not the main protocol).
  *
  * Multi-peer model: every device runs a [WsTransferServer] and can open any number
@@ -48,13 +51,22 @@ import kotlinx.coroutines.launch
  * File transfer: `FLASH_FILE_START` (text), raw bytes as 64 KiB binary frames in
  * order, `FLASH_FILE_END` (text), then the receiver answers `FLASH_FILE_ACK`.
  * One active transfer per connection keeps the simple ordered-stream design valid.
+ *
+ * Identity seam (C7): device identity is constructor-injected (`localDeviceId`,
+ * `localFriendlyName`) instead of read from the `:app` `AppIdentity`; the future
+ * `:core:engine` / `:app` wiring passes the current identity at construction.
  */
-class WsTransferManager(context: Context) : WsConnection.Listener {
+class WsTransferManager(
+    context: Context,
+    localDeviceId: String,
+    localFriendlyName: String,
+) : WsConnection.Listener {
 
     private val appContext = context.applicationContext
-    private val identity = AppIdentity(appContext)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val localNetworkAddresses = LocalNetworkAddresses(appContext)
+    private val deviceId: String = localDeviceId
+    private val friendlyName: String = localFriendlyName
 
     private val lock = Any()
     private val connections = mutableListOf<WsConnection>()
@@ -71,24 +83,24 @@ class WsTransferManager(context: Context) : WsConnection.Listener {
         onConnection = ::registerInboundConnection,
     )
     private val client = WsTransferClient(appContext, connectionListener = this)
-    private val pairingStore = WsPairingStore(appContext)
+    private val pairingStore = WsPairingStore(AndroidPreferencesTrustStore(appContext))
     private val discovery = WsDiscovery(
         context = appContext,
-        localDeviceId = identity.deviceId,
-        friendlyName = identity.friendlyName,
+        localDeviceId = deviceId,
+        friendlyName = friendlyName,
         onDeviceFound = ::onDeviceDiscovered,
         onDeviceLost = ::onDiscoveredLost,
         onStatusChanged = ::onDiscoveryStatus,
     )
 
-    private val discoveredById = mutableMapOf<String, DiscoveredDevice>()
+    private val discoveredById = mutableMapOf<String, LegacyDiscoveredDevice>()
     private val connectingDeviceIds = mutableSetOf<String>()
     private val autoConnectAttempts = mutableMapOf<String, Long>()
 
     private val _state = MutableStateFlow(
         WsTransferUiState(
-            localDeviceId = identity.deviceId,
-            friendlyName = identity.friendlyName,
+            localDeviceId = deviceId,
+            friendlyName = friendlyName,
         )
     )
     val state: StateFlow<WsTransferUiState> = _state
@@ -224,13 +236,13 @@ class WsTransferManager(context: Context) : WsConnection.Listener {
             if (outbound) outboundConnections += connection
         }
         connection.start()
-        // Async: this method can run on the main thread (connect continuation),
-        // and StrictMode forbids socket writes there.
-        connection.sendTextAsync(WsTransferMessages.hello(identity.deviceId, identity.friendlyName))
+        // Async: this method can run on any thread (connect continuation),
+        // and StrictMode forbids socket writes on the main thread.
+        connection.sendTextAsync(WsTransferMessages.hello(deviceId, friendlyName))
     }
 
     private fun registerPeerHello(connection: WsConnection, hello: WsTransferMessages.Hello) {
-        if (hello.deviceId == identity.deviceId) {
+        if (hello.deviceId == deviceId) {
             connection.close("Connected to self")
             _state.update { it.copy(lastConnectResult = "That address is this device — connect to another phone.") }
             return
@@ -263,7 +275,7 @@ class WsTransferManager(context: Context) : WsConnection.Listener {
 
     // region discovery + auto-reconnect
 
-    private fun onDeviceDiscovered(device: DiscoveredDevice) {
+    private fun onDeviceDiscovered(device: LegacyDiscoveredDevice) {
         synchronized(lock) { discoveredById[device.deviceId] = device }
         refreshDiscovered()
         maybeAutoConnect(device)
@@ -282,7 +294,7 @@ class WsTransferManager(context: Context) : WsConnection.Listener {
     }
 
     /** Already-paired devices reconnect automatically as soon as their server reappears. */
-    private fun maybeAutoConnect(device: DiscoveredDevice) {
+    private fun maybeAutoConnect(device: LegacyDiscoveredDevice) {
         if (!pairingStore.isPaired(device.deviceId)) return
         val shouldConnect = synchronized(lock) {
             val alreadyConnected = primaryByPeerId.containsKey(device.deviceId)
@@ -304,7 +316,7 @@ class WsTransferManager(context: Context) : WsConnection.Listener {
         }
     }
 
-    private fun connectToDevice(device: DiscoveredDevice) {
+    private fun connectToDevice(device: LegacyDiscoveredDevice) {
         scope.launch {
             runCatching { client.connect(device.hostAddress, device.port) }
                 .onSuccess { connection ->

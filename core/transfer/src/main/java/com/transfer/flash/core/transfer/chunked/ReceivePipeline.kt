@@ -1,0 +1,298 @@
+package com.transfer.flash.core.transfer.chunked
+
+/**
+ * Receive-side orchestration for chunked transfers (C5.5/C5.6). Pure logic — all I/O sits behind
+ * the injected [ChunkSink] and optional [WholeFileDigestProvider]; zero Android types.
+ *
+ * ## Contract
+ *
+ * - Feed wire bytes to [onFrame] (any frame type; wrong-direction frames are rejected, not
+ *   thrown on). Returned events carry every actionable output (ACK batches, COMPLETE,
+ *   rejections) so transports stay dumb pipes.
+ * - **Verify-before-write (C5.5):** each CHUNK's embedded raw SHA-256 is recomputed and compared
+ *   in constant time BEFORE [ChunkSink.write]. A mismatched chunk produces
+ *   [ReceiveEvent.Rejected] with [RejectReason.HASH_MISMATCH], is never written, never marked,
+ *   and never ACKed — its absence from ACK batches is the implicit NACK that drives targeted
+ *   single-chunk repair, mirroring LocalSend's per-file `422` checksum-mismatch response
+ *   narrowed to chunk granularity (https://github.com/localsend/protocol §4.2; BitTorrent-style
+ *   piece-level verification: https://bittorrent.org/bittorrentecon.pdf).
+ * - **Duplicates are idempotent:** an already-received index is still ACKed (the sender's mirror
+ *   must converge) but never rewritten.
+ * - **Out-of-order tolerance:** chunks may arrive in any order; the sink receives them verbatim
+ *   with their index. Strict sequencing remains a transport-layer concern (C5.7 multi-stream
+ *   assigns ranges).
+ * - **ACK batching:** one `ACK_BATCH` is emitted every [ackEvery] distinct received chunks
+ *   ([flushPendingAck] forces a partial batch — call it on idle timers or connection loss).
+ * - **COMPLETE** is emitted only once, when the resume bit-vector is complete; if
+ *   [recheckWholeFileDigest] is enabled, `verified` additionally requires the injected
+ *   [WholeFileDigestProvider] digest to match `FILE_START.fileSha256Hex`.
+ */
+class ReceivePipeline(
+    private val sink: ChunkSink,
+    private val ackEvery: Int = DEFAULT_ACK_EVERY,
+    private val recheckWholeFileDigest: Boolean = false,
+    private val wholeFileDigest: WholeFileDigestProvider? = null,
+    private val maxConcurrentSessions: Int = DEFAULT_MAX_SESSIONS,
+) {
+    init {
+        require(ackEvery > 0) { "ackEvery must be > 0" }
+        require(maxConcurrentSessions > 0) { "maxConcurrentSessions must be > 0" }
+        if (recheckWholeFileDigest) {
+            requireNotNull(wholeFileDigest) {
+                "recheckWholeFileDigest=true requires a WholeFileDigestProvider"
+            }
+        }
+    }
+
+    private val sessions = LinkedHashMap<String, Session>()
+
+    /** Snapshot of per-transfer progress vectors keyed by transferId. */
+    val progressVectors: Map<String, ResumeBitVector>
+        get() = sessions.mapValues { (_, s) -> s.vector }
+
+    fun activeTransferIds(): Set<String> = sessions.keys.toSet()
+
+    /**
+     * Processes one inbound frame payload.
+     * Never throws on untrusted input; malformed/hostile frames surface as
+     * [ReceiveEvent.Rejected]([RejectReason.MALFORMED_FRAME]).
+     */
+    fun onFrame(bytes: ByteArray): List<ReceiveEvent> {
+        return when (val frame = ChunkFrame.parse(bytes)) {
+            null -> listOf(ReceiveEvent.Rejected(RejectReason.MALFORMED_FRAME, null))
+            is ChunkFrame.FileStart -> handleFileStart(frame)
+            is ChunkFrame.Chunk -> handleChunk(frame)
+            is ChunkFrame.AckBatch -> listOf(reject(RejectReason.UNEXPECTED_DIRECTION, frame.transferId))
+            is ChunkFrame.Complete -> listOf(reject(RejectReason.UNEXPECTED_DIRECTION, frame.transferId))
+        }
+    }
+
+    /** Emits (and clears) any pending partial ACK batch; null when nothing pending. */
+    fun flushPendingAck(): ReceiveEvent? {
+        for ((transferId, session) in sessions) {
+            if (!session.finished && session.pending.isNotEmpty()) {
+                return buildAck(session, transferId)
+            }
+        }
+        return null
+    }
+
+    fun doneIndexes(transferId: String): List<Int>? =
+        sessions[transferId]?.vector?.doneIndexes()
+
+    /** Serialized bit-vector for persistence (C5.6 `TransferChunkEntity`); null if unknown id. */
+    fun serializedProgress(transferId: String): ByteArray? =
+        sessions[transferId]?.vector?.toSerialized()
+
+    fun clear() = sessions.clear()
+
+    private fun handleFileStart(frame: ChunkFrame.FileStart): List<ReceiveEvent> {
+        val validationError = validateFileStart(frame)
+        if (validationError != null) return listOf(reject(validationError, frame.transferId))
+
+        val existing = sessions[frame.transferId]
+        if (existing != null) {
+            // Identical re-offer == resume restart: keep accumulated progress, no event.
+            // Different facts for the same id is a hard protocol conflict.
+            return if (existing.start == frame) {
+                emptyList()
+            } else {
+                listOf(reject(RejectReason.SESSION_CONFLICT, frame.transferId))
+            }
+        }
+        if (sessions.size >= maxConcurrentSessions) {
+            return listOf(reject(RejectReason.SESSION_FULL, frame.transferId))
+        }
+        sessions[frame.transferId] = Session(
+            start = frame,
+            vector = ResumeBitVector(frame.totalChunks),
+        )
+        return emptyList()
+    }
+
+    private fun handleChunk(frame: ChunkFrame.Chunk): List<ReceiveEvent> {
+        val session = sessions[frame.transferId]
+            ?: return listOf(reject(RejectReason.UNKNOWN_TRANSFER, frame.transferId))
+        if (frame.fileId != session.start.fileId) {
+            return listOf(reject(RejectReason.FILE_ID_MISMATCH, frame.transferId))
+        }
+        if (session.finished) {
+            // Late duplicate after COMPLETE: idempotent silence — sender's mirror
+            // already holds every index once coverage was reached (C5.3 contract).
+            return emptyList()
+        }
+        val totalChunks = session.start.totalChunks
+        if (frame.index < 0 || frame.index >= totalChunks) {
+            return listOf(
+                ReceiveEvent.Rejected(RejectReason.INDEX_OUT_OF_RANGE, frame.transferId, frame.index),
+            )
+        }
+        val expectedLength = expectedChunkLength(session, frame.index)
+        if (frame.data.size != expectedLength) {
+            return listOf(
+                ReceiveEvent.Rejected(RejectReason.CHUNK_SIZE_MISMATCH, frame.transferId, frame.index),
+            )
+        }
+
+        val alreadyReceived = session.vector.isReceived(frame.index)
+        val computed = Sha256.digest(frame.data)
+        if (!Sha256.rawEqualsConstantTime(computed, frame.chunkSha256)) {
+            // Verify-before-write: reject WITHOUT writing, marking, or ACKing (implicit NACK).
+            return listOf(
+                ReceiveEvent.Rejected(RejectReason.HASH_MISMATCH, frame.transferId, frame.index),
+            )
+        }
+
+        if (!alreadyReceived) {
+            sink.write(frame.index, frame.data)
+        }
+        val newlyMarked = session.vector.markReceived(frame.index)
+        session.pending.add(frame.index)
+
+        if (session.vector.isComplete()) {
+            val events = ArrayList<ReceiveEvent>(2)
+            if (session.pending.isNotEmpty()) {
+                events.add(buildAck(session, frame.transferId))
+            }
+            session.finished = true
+            events.add(buildComplete(session, frame.transferId))
+            return events
+        }
+        return if (newlyMarked && session.pending.size >= ackEvery) {
+            listOf(buildAck(session, frame.transferId))
+        } else {
+            emptyList()
+        }
+    }
+
+    private fun buildAck(session: Session, transferId: String): ReceiveEvent.AckBatchReady {
+        val indexes = session.pending.toList()
+        session.pending.clear()
+        return ReceiveEvent.AckBatchReady(
+            ChunkFrame.AckBatch(transferId, session.start.fileId, indexes),
+        )
+    }
+
+    private fun buildComplete(session: Session, transferId: String): ReceiveEvent.Completed {
+        var verified = true
+        if (recheckWholeFileDigest) {
+            val observed = wholeFileDigest?.currentDigestHex()
+            verified = observed != null &&
+                Sha256.hexEqualsConstantTime(
+                    Sha256.normalizeHex(observed),
+                    Sha256.normalizeHex(session.start.fileSha256Hex),
+                )
+        }
+        return ReceiveEvent.Completed(
+            ChunkFrame.Complete(transferId, session.start.fileId, verified),
+        )
+    }
+
+    private fun validateFileStart(frame: ChunkFrame.FileStart): RejectReason? {
+        if (!Sha256.isValidHex(frame.fileSha256Hex)) return RejectReason.INVALID_FILE_START
+        if (frame.totalBytes <= 0 || frame.totalChunks <= 0) return RejectReason.INVALID_FILE_START
+        if (frame.chunkSize < Chunker.MIN_CHUNK_SIZE_BYTES ||
+            frame.chunkSize > Chunker.MAX_CHUNK_SIZE_BYTES
+        ) {
+            return RejectReason.INVALID_FILE_START
+        }
+        val expectedChunks = (frame.totalBytes + frame.chunkSize - 1) / frame.chunkSize
+        if (expectedChunks != frame.totalChunks.toLong()) return RejectReason.INVALID_FILE_START
+        return null
+    }
+
+    private fun expectedChunkLength(session: Session, index: Int): Int {
+        val start = session.start
+        val fullEnd = (index + 1).toLong() * start.chunkSize
+        return if (fullEnd <= start.totalBytes) start.chunkSize
+        else (start.totalBytes - index.toLong() * start.chunkSize).toInt()
+    }
+
+    private fun reject(reason: RejectReason, transferId: String?): ReceiveEvent.Rejected =
+        ReceiveEvent.Rejected(reason, transferId)
+
+    private class Session(
+        val start: ChunkFrame.FileStart,
+        val vector: ResumeBitVector,
+    ) {
+        val pending = sortedSetOf<Int>()
+        var finished = false
+    }
+
+    companion object {
+
+        /** Shared default batch size — both pipelines must agree (C5.7 keeps this constant). */
+        const val DEFAULT_ACK_EVERY: Int = 32
+
+        private const val DEFAULT_MAX_SESSIONS: Int = 32
+    }
+}
+
+/** Destination abstraction: persists one verified chunk at [index]. */
+fun interface ChunkSink {
+
+    fun write(index: Int, data: ByteArray)
+}
+
+/**
+ * Optional whole-file digest seam for final re-checks (e.g. hashing the assembled destination
+ * via random access after all chunks landed). Returning null defers to per-chunk trust.
+ */
+fun interface WholeFileDigestProvider {
+
+    fun currentDigestHex(): String?
+}
+
+sealed interface ReceiveEvent {
+
+    /** Receiver → sender confirmation carrying deduplicated ascending verified indexes. */
+    data class AckBatchReady(val frame: ChunkFrame.AckBatch) : ReceiveEvent
+
+    /** Emitted exactly once per session when the last verified chunk lands. */
+    data class Completed(val frame: ChunkFrame.Complete) : ReceiveEvent
+
+    /**
+     * Graceful rejection: the pipeline stays usable; the reason drives engine-level retry /
+     * targeted repair decisions.
+     */
+    data class Rejected(
+        val reason: RejectReason,
+        val transferId: String?,
+        val index: Int = -1,
+    ) : ReceiveEvent
+}
+
+enum class RejectReason {
+    /** Unparseable bytes: bad magic/version/type, truncation, trailing garbage. */
+    MALFORMED_FRAME,
+
+    /** CHUNK/ACK/COMPLETE for a transferId this pipeline never saw FILE_START for. */
+    UNKNOWN_TRANSFER,
+
+    /** FILE_START re-declared with different facts than the original session. */
+    SESSION_CONFLICT,
+
+    /** FILE_START failed math/size validation (totalChunks math, size>0, chunk bounds). */
+    INVALID_FILE_START,
+
+    /** Session capacity exhausted — back off and retry later. */
+    SESSION_FULL,
+
+    /** Chunk belongs to the right transfer but the wrong file. */
+    FILE_ID_MISMATCH,
+
+    /** Data arrived after the session already completed. */
+    SESSION_FINISHED,
+
+    /** Index outside [0, totalChunks). */
+    INDEX_OUT_OF_RANGE,
+
+    /** Data length does not match the expected length for its index. */
+    CHUNK_SIZE_MISMATCH,
+
+    /** Embedded hash failed constant-time comparison — NOT written, NOT acked (repair path). */
+    HASH_MISMATCH,
+
+    /** Sender-only frames (ACK_BATCH/COMPLETE) fed into the receive side. */
+    UNEXPECTED_DIRECTION,
+}

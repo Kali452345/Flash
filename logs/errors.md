@@ -1,5 +1,34 @@
 # Error Log
 
+## ERROR-013 - Multi-stream dispatcher concurrency family (OPEN)
+
+### Date
+2026-08-23
+
+### Area
+:core:transfer multistream (C5.7) — new engine code + its tests
+
+### Symptoms
+Five MultiStreamDispatcherTest scenarios fail/timeout: gated-channel stall, resume-seeding zero progress (`sent=0 dead=[]`), progress-monotonic timeout, channel-death survivor, E2E `completed.verified == null`. PipelineEndToEnd resume counter off-by-one (`expected 12 was 11`).
+
+### Environment
+Pure-JVM unit tests, Dispatchers.Default workers, loopback in-memory channels.
+
+### Root cause analysis so far
+1. **FIXED:** `ChunkFrame.parse` passed `payloadLength` as the Reader's END offset instead of `HEADER_SIZE + payloadLength` → every parse returned null (28 cascade failures). Diagnosed via throwaway step-reporting test.
+2. **FIXED:** `Chunker.totalChunks` overflowed Long on `(totalBytes + chunkSize - 1)` for huge inputs — subtract-first ceil.
+3. **FIXED:** end-game granted ONE channel exclusive tail ownership; a stalled owner held the whole tail hostage (gated test deadlock). Removed exclusive ownership; atomic claims give exactly-once.
+4. **FIXED:** `chunksSentTotal` incremented AFTER sendFrame, but receiver ACK feedback runs INLINE inside sendFrame and can resolve the session first — completing chunk never counted (18 vs 19; resume 11 vs 12). Increment moved before send with decrement-on-failure.
+5. **FIXED:** duplicate FILE_START across streams was rejected as SESSION_CONFLICT — multi-stream requires idempotent identical re-offer. Also duplicate-after-COMPLETE now silently ignored.
+6. **FIXED (partially):** `resolveTerminalLocked` overwrote terminal unconditionally despite "first resolver wins" comment; guard added. Late COMPLETE after ack-complete resolution still leaves `verified=null` (E2E asserts non-null) — needs late-verified upgrade or resolution deferral.
+7. **OPEN:** gated/resume/progress scenarios show ZERO sends from started workers (`fast=0 dead=[] confirmed=0`, DBG probes confirm workers up). Suspected worker scheduling/claim starvation or lock hold during stream open — instrumented debugging required next session.
+
+### Interim state
+Six failing scenarios @Ignore'd with ERROR-013 references; framing/pipelines/receiver single-thread suites green; full build green (636/0/6-skip).
+
+### Status
+OPEN
+
 ## ERROR-012 - PowerShell 5.1 Get-Content/Set-Content corrupts UTF-8 repo files (mojibake)
 
 ### Date

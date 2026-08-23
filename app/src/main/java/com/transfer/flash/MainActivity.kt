@@ -24,8 +24,8 @@ import dagger.hilt.android.AndroidEntryPoint
 
 /**
  * Showcase host. Provisional demo pages (LAN home, icon/motion QA sheets, experimental
- * WS transfer) were removed per owner decision — engine code (LanController,
- * WsTransferManager) remains for relocation into :core:* per docs/core-upgrade-plan.md.
+ * WS transfer) were removed per owner decision — engine code (LanController)
+ * remains for relocation into :core:* per docs/core-upgrade-plan.md.
  *
  * Bottom navigation + settings pages land via docs/ui-page-plan.md.
  */

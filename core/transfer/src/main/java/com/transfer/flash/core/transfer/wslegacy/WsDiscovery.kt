@@ -1,25 +1,27 @@
-package com.transfer.flash.wstransfer
+package com.transfer.flash.core.transfer.wslegacy
 
 import android.content.Context
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.common.model.FlashTransportType
 import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
 import com.transfer.flash.core.discovery.nsd.NsdFlashDiscovery
-import com.transfer.flash.model.DiscoveredDevice
-import com.transfer.flash.model.TransportType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * Compatibility adapter for [NsdFlashDiscovery] in the experimental WebSocket transfer manager.
+ * LEGACY relocation (C5.1): pre-chunked whole-file 64KiB-frame engine retained as
+ * fallback/reference; superseded by transfer.chunked pipelines (C5.3+) — scheduled for
+ * deletion after parity.
+ *
+ * Compatibility adapter for [NsdFlashDiscovery] in the legacy WebSocket transfer manager.
  */
 class WsDiscovery(
     context: Context,
     localDeviceId: String,
     friendlyName: String,
-    onDeviceFound: (DiscoveredDevice) -> Unit,
+    onDeviceFound: (LegacyDiscoveredDevice) -> Unit,
     onDeviceLost: (String) -> Unit,
     onStatusChanged: (String) -> Unit,
 ) {
@@ -63,14 +65,14 @@ class WsDiscovery(
         scope.launch { engine.stopAll() }
     }
 
-    private fun FlashDiscoveredEndpoint.toLegacyModel(): DiscoveredDevice {
-        return DiscoveredDevice(
+    private fun FlashDiscoveredEndpoint.toLegacyModel(): LegacyDiscoveredDevice {
+        return LegacyDiscoveredDevice(
             deviceId = deviceId.value,
             friendlyName = friendlyName,
             hostAddress = hostAddress,
             port = port,
             serviceName = serviceName,
-            transportType = TransportType.LAN,
+            transportType = LegacyTransportType.LAN,
             protocolVersion = device.protocolVersion,
         )
     }

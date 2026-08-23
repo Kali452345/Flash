@@ -52,6 +52,8 @@ publishing {
 dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:security"))
+    // C3→C4 route binder consumes discovery endpoint models (one-way dep; no cycle).
+    implementation(project(":core:discovery"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
