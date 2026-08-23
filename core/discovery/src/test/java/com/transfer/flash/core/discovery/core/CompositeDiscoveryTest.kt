@@ -277,6 +277,58 @@ class CompositeDiscoveryTest {
         assertEquals("192.168.49.9", endpoints[0].hostAddress)
     }
 
+    @Test
+    fun sweeper_automatic_agesOutDepartedPeer_withoutManualSweepCalls() = runBlocking {
+        // Regression (P3.5 field report): a peer that stops advertising or drops
+        // off Wi-Fi stayed visible forever because nothing drove the clock.
+        // The engine must age endpoints out on its own once running.
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val releaseSweeper = java.util.concurrent.CountDownLatch(1)
+        val scope = CoroutineScope(SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+        val lan = FakeTransport("LAN")
+        val composite = CompositeDiscovery(
+            transports = listOf(lan),
+            scopeFactory = { scope },
+            clock = { now.get() },
+            // Sweeper ticks block on the latch so the test controls pacing; each
+            // released tick advances virtual time by one interval.
+            delayFn = { ms ->
+                releaseSweeper.await()
+                now.addAndGet(ms)
+            },
+            sweepIntervalMs = 15_000,
+            maxSweepLoops = 2, // terminate deterministically after grace elapses
+        )
+        val endpoints = java.util.concurrent.atomic.AtomicReference(
+            composite.discoveredEndpoints.value,
+        )
+        scope.launch {
+            composite.discoveredEndpoints.collect { endpoints.set(it) }
+        }
+
+        composite.startAll(40_000, identity)
+        fun awaitSize(expected: Int): Boolean {
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+            while (System.nanoTime() < deadline) {
+                if (endpoints.get().size == expected) return true
+                if (expected > 0) {
+                    // Collector may not be subscribed yet (IO dispatch race);
+                    // re-announce safely — duplicates dedup to Unchanged.
+                    lan.found(endpointOf("d1"))
+                }
+                Thread.sleep(10)
+            }
+            return false
+        }
+        org.junit.Assert.assertTrue(awaitSize(1))
+
+        releaseSweeper.countDown()
+        // Loop 1: now=15_000 — inside grace, stays. Loop 2: now=30_000 — exactly
+        // at the inclusive boundary → aged out WITHOUT any manual sweep call.
+        org.junit.Assert.assertTrue(awaitSize(0))
+        scope.cancel()
+    }
+
     // ------------------------------------------------------------------
     // startAll aggregation
     // ------------------------------------------------------------------

@@ -83,6 +83,15 @@ class CompositeDiscovery(
     private val directoryFactory: () -> EndpointDirectory = { StandardEndpointDirectory() },
     scopeFactory: () -> CoroutineScope = { CoroutineScope(SupervisorJob() + Dispatchers.Default) },
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * Period between automatic presence sweeps while any transport runs
+     * (P3.5 fix: radio goodbyes are routinely missed — RFC 6762 §10.1 — so
+     * aging MUST be driven internally, not left to callers).
+     */
+    private val sweepIntervalMs: Long = DEFAULT_SWEEP_INTERVAL_MS,
+    private val delayFn: suspend (Long) -> Unit = { ms -> kotlinx.coroutines.delay(ms) },
+    /** Determinism hook for JVM tests (same pattern as NsdTransport.maxDutyCycles). */
+    private val maxSweepLoops: Int = Int.MAX_VALUE,
 ) : FlashDiscovery {
 
     companion object {
@@ -91,6 +100,13 @@ class CompositeDiscovery(
          * the mDNS-TTL research behind choosing 30 s.
          */
         const val DEFAULT_GRACE_MS: Long = 30_000L
+
+        /**
+         * Default period between automatic sweeps: fast enough that a departed
+         * peer disappears at most ~[DEFAULT_SWEEP_INTERVAL_MS] + [DEFAULT_GRACE_MS]
+         * after its last real sighting, slow enough to be negligible load.
+         */
+        const val DEFAULT_SWEEP_INTERVAL_MS: Long = 5_000L
 
         /** Highest priority first; unknown names rank after these. */
         val PRIORITY_ORDER: List<String> = listOf("LAN", "WIFI_DIRECT", "WIFI_AWARE", "BLE")
@@ -107,6 +123,7 @@ class CompositeDiscovery(
     private val browsingByTransport = HashMap<String, Boolean>()
     private val advertisingByTransport = HashMap<String, Boolean>()
     private var collecting = false
+    private var sweeperJob: kotlinx.coroutines.Job? = null
 
     private var advertisedPort: Int = 0
     private var identity: FlashAdvertisedIdentity? = null
@@ -213,6 +230,7 @@ class CompositeDiscovery(
     }
 
     override suspend fun stopAll(): FlashResult<Unit> {
+        stopSweeper()
         val result = aggregate { transport ->
             transport.stop().onSuccess {
                 markBrowsing(transport.transportName, false)
@@ -249,6 +267,7 @@ class CompositeDiscovery(
         this.advertisedPort = port
         val failures = mutableListOf<String>()
         synchronized(lock) { collectingOrStart() }
+        startSweeperLocked()
         for (transport in transports) {
             val advResult = transport.startAdvertising(port, identity)
             val browseResult = transport.startBrowsing()
@@ -387,6 +406,31 @@ class CompositeDiscovery(
                 transport.events.collect { event -> handleEvent(transport, event) }
             }
         }
+    }
+
+    /**
+     * Automatic presence aging while the engine runs (P3.5 stale-endpoint fix):
+     * sweeps every [sweepIntervalMs] so departed peers converge to Lost at most
+     * ~grace + interval after their last sighting, even when radios miss
+     * goodbye packets. Bounded by [maxSweepLoops] as a JVM-test hook.
+     */
+    private fun startSweeperLocked() {
+        if (sweeperJob?.isActive == true) return
+        sweeperJob = scope.launch {
+            var loops = 0
+            while (loops < maxSweepLoops && kotlinx.coroutines.currentCoroutineContext()
+                    .let { it[kotlinx.coroutines.Job]?.isActive == true }
+            ) {
+                delayFn(sweepIntervalMs)
+                sweep(nowMs = clock())
+                loops += 1
+            }
+        }
+    }
+
+    private fun stopSweeper() {
+        sweeperJob?.cancel()
+        sweeperJob = null
     }
 
     private fun handleEvent(transport: FlashRadioTransport, event: FlashTransportEvent) {
