@@ -43,7 +43,7 @@
 `testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase P5 part 1 + option-2 integration COMPLETE (2026-08-23): :core:transfer chunked framing v2 (binary FLSH, per-chunk SHA-256, ACK batching, resume bit-vector) + multi-stream dispatcher/receiver (dynamic claims; 5 concurrency scenarios @Ignore under OPEN ERROR-013) + wslegacy relocation (C5.1). Option 2 wired: DiscoveryRouteBinder C3-to-C4 seam + DefaultFlashNetwork in engine holder + Dev Console tap-to-connect/health. 636 tests / 0 failures / 6 skipped. NEXT: ERROR-013 root-cause OR P5 part 2 (FlashTransferRepository over pipelines, C5.2/C5.9/C5.12).**
+**MID-TASK HANDOFF (2026-08-23, project moving to internal SSD): ERROR-013 root cause FOUND+FIXED in uncommitted working tree - v3 MultiStreamDispatcher rewrite was missing FILE_START session announcement; receive pipeline rejected all chunks as UNKNOWN_TRANSFER (single bug behind every zero-progress/all-dead/confirmed=0 symptom). Fix applied but UNTESTED + debug probes still present. NEXT SESSION: read NEXT_SESSION_PROMPT.md at project root for complete continuation plan (remove probes, test, commit, then P5 part 2). Green baseline: commit 5b0fff7, 636 tests / 0 failures / 6 skipped.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` â€” two-pane not yet consumed by screens (integration pending).
