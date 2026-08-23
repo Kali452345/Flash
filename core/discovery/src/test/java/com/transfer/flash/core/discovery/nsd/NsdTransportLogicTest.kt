@@ -2,8 +2,10 @@ package com.transfer.flash.core.discovery.nsd
 
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
+import com.transfer.flash.core.discovery.core.DiscoveryModePolicy
 import com.transfer.flash.core.discovery.core.EndpointDirectory
 import com.transfer.flash.core.discovery.core.FlashAdvertisedIdentity
+import com.transfer.flash.core.discovery.core.FlashDiscoveryMode
 import com.transfer.flash.core.discovery.core.FlashTransportEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -44,6 +46,8 @@ class NsdTransportLogicTest {
         host: String? = "192.168.1.50",
         port: Int = 45821,
         proto: String = "2",
+        caps: String? = null,
+        fp8: String? = null,
     ) = ResolvedServiceData(
         hostAddress = host,
         port = port,
@@ -53,6 +57,8 @@ class NsdTransportLogicTest {
             put(NsdTxtCodec.KEY_NAME, "Peer Name")
             put(NsdTxtCodec.KEY_MODEL, "Model X")
             put(NsdTxtCodec.KEY_PROTO, proto)
+            if (caps != null) put(NsdTxtCodec.KEY_CAPS, caps)
+            if (fp8 != null) put(NsdTxtCodec.KEY_FP8, fp8)
         },
     )
 
@@ -98,8 +104,10 @@ class NsdTransportLogicTest {
         var advertiseResult = true
         var monitorResult = true
         var stopBrowseCalled = false
+        var stopBrowseCount = 0
         var monitorsCancelled = false
         var unadvertiseCalled = false
+        var unadvertiseCount = 0
 
         lateinit var browseEvents: BrowseEvents
             private set
@@ -118,6 +126,7 @@ class NsdTransportLogicTest {
 
         override fun unadvertise(events: AdvertiseEvents) {
             unadvertiseCalled = true
+            unadvertiseCount += 1
         }
 
         override fun startBrowse(request: BrowseRequest, events: BrowseEvents): Boolean {
@@ -128,6 +137,7 @@ class NsdTransportLogicTest {
 
         override fun stopBrowse() {
             stopBrowseCalled = true
+            stopBrowseCount += 1
         }
 
         override fun monitor(request: MonitorRequest, events: MonitorEvents): Boolean {
@@ -164,8 +174,14 @@ class NsdTransportLogicTest {
         bridge: FakeBridge,
         maxRestarts: Int = 5,
         delays: MutableList<Long>? = null,
+        modePolicy: DiscoveryModePolicy? = null,
+        maxDutyCycles: Int = Int.MAX_VALUE,
+        idleWaits: MutableList<Long>? = null,
+        slept: MutableList<Long>? = null,
     ): NsdTransport {
         val recordedDelays = delays
+        val recordedIdleWaits = idleWaits
+        val recordedSlept = slept
         return NsdTransport(
             context = null,
             apiLevel = FakeApiLevel(apiLevel),
@@ -175,9 +191,16 @@ class NsdTransportLogicTest {
                 (1000L * attempt).also { recordedDelays?.add(it) }
             },
             maxBrowsingRestarts = maxRestarts,
+            maxDutyCycles = maxDutyCycles,
+            initialModePolicy = modePolicy
+                ?: DiscoveryModePolicy.forMode(FlashDiscoveryMode.STANDARD),
             dispatcher = Dispatchers.Unconfined,
             timeSourceMs = { 1_000L },
-            sleep = { /* no-op: deterministic, no virtual time needed */ },
+            sleep = { ms -> recordedSlept?.add(ms) /* no-op: deterministic, no virtual time */ },
+            idleWaitOverride = { ms ->
+                recordedIdleWaits?.add(ms)
+                false // full gap elapsed; deterministic, no virtual time needed
+            },
             logInfo = {},
             logWarn = {},
             bridgeOverride = bridge,
@@ -428,6 +451,181 @@ class NsdTransportLogicTest {
     }
 
     // ------------------------------------------------------------------
+    // P3.5-A2/A4: TXT caps/fp8 on the wire + inbound hardening
+    // ------------------------------------------------------------------
+
+    @Test
+    fun startAdvertising_capsAndFp8_includedInTxtRecords() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge)
+        val richIdentity = FlashAdvertisedIdentity(
+            FlashDeviceId("self-1"), "My Phone", "Pixel 7", 2,
+            capabilities = setOf("kiosk", "voice"),
+            fingerprintPrefix = "deadbeef",
+        )
+
+        runBlocking { transport.startAdvertising(45821, richIdentity) }
+
+        val request = bridge.advertiseRequests.single()
+        assertEquals("kiosk,voice", request.txtRecords[NsdTxtCodec.KEY_CAPS])
+        assertEquals("deadbeef", request.txtRecords[NsdTxtCodec.KEY_FP8])
+    }
+
+    @Test
+    fun versionMismatch_droppedPreDirectory() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+
+        bridge.fireServiceFound("svc-old")
+        bridge.fireMonitorUpdated(resolvedData(serviceName = "svc-old", proto = "1"))
+
+        assertTrue(directory.seenCalls.isEmpty())
+    }
+
+    @Test
+    fun missingProto_fallsBackToOurVersion_accepted() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+        val recorder = EventRecorder(transport)
+
+        directory.seenResults.addLast(DiffFound(endpointOf("peer-1")))
+        // No proto attribute at all: tolerant fallback keeps legacy peers visible.
+        bridge.fireServiceFound("svc-noproto")
+        bridge.fireMonitorUpdated(
+            ResolvedServiceData(
+                hostAddress = "192.168.1.50",
+                port = 45821,
+                serviceName = "svc-noproto",
+                attributes = mapOf(NsdTxtCodec.KEY_DEVICE_ID to "peer-1"),
+            ),
+        )
+
+        assertEquals(1, directory.seenCalls.size)
+        recorder.cancel()
+    }
+
+    @Test
+    fun peerCaps_informationalOnly_peerStillAccepted() {
+        val bridge = FakeBridge()
+        val directory = FakeDirectory()
+        val transport = newTransport(apiLevel = 34, directory = directory, bridge = bridge)
+        runBlocking { transport.startBrowsing() }
+
+        // Unknown/foreign caps must NOT drop the endpoint: caps are informational,
+        // enforcement is deferred to connect time (C3.10 seam).
+        directory.seenResults.addLast(DiffFound(endpointOf("peer-1")))
+        bridge.fireServiceFound("svc-caps")
+        bridge.fireMonitorUpdated(resolvedData(caps = "totally-unknown-cap,kiosk", fp8 = "cafe1234"))
+
+        assertEquals(1, directory.seenCalls.size)
+    }
+
+    // ------------------------------------------------------------------
+    // P3.5-B2: mode wiring (GHOST / ECO / BOOST)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun ghostMode_startAdvertisingIsDocumentedNoOp_neverCallsBridgeAdvertise() {
+        val bridge = FakeBridge()
+        val transport = newTransport(
+            apiLevel = 34,
+            directory = FakeDirectory(),
+            bridge = bridge,
+            modePolicy = DiscoveryModePolicy.forMode(FlashDiscoveryMode.GHOST),
+        )
+
+        runBlocking {
+            val result = transport.startAdvertising(45821, identity(id = "self-1"))
+            assertTrue(result.isSuccess)
+        }
+
+        assertTrue(bridge.advertiseRequests.isEmpty())
+    }
+
+    @Test
+    fun setMode_ghostWhileAdvertising_unadvertisesImmediately_thenResumeOnExit() {
+        val bridge = FakeBridge()
+        val transport = newTransport(apiLevel = 34, directory = FakeDirectory(), bridge = bridge)
+        runBlocking {
+            transport.startAdvertising(45821, identity(id = "self-1"))
+            assertEquals(1, bridge.advertiseRequests.size)
+
+            transport.setMode(DiscoveryModePolicy.forMode(FlashDiscoveryMode.GHOST))
+            assertTrue(bridge.unadvertiseCalled)
+
+            // Leaving GHOST resumes advertising from the retained identity/port.
+            transport.setMode(DiscoveryModePolicy.forMode(FlashDiscoveryMode.STANDARD))
+            assertEquals(2, bridge.advertiseRequests.size)
+            assertEquals(45821, bridge.advertiseRequests.last().port)
+        }
+    }
+
+    @Test
+    fun ecoMode_browseAndIdleAlternate_overDutyCycleBudget() {
+        val bridge = FakeBridge()
+        val idleWaits = mutableListOf<Long>()
+        val eco = DiscoveryModePolicy.forMode(FlashDiscoveryMode.ECO)
+        val transport = newTransport(
+            apiLevel = 34,
+            directory = FakeDirectory(),
+            bridge = bridge,
+            modePolicy = eco,
+            maxDutyCycles = 2,
+            idleWaits = idleWaits,
+        )
+        runBlocking { transport.startBrowsing() }
+
+        // Two full bursts, each followed by stopBrowse + one full idle gap;
+        // budget exhaustion ends the loop deterministically (test hook).
+        assertEquals(2, bridge.browseRequests.size)
+        assertEquals(2, bridge.stopBrowseCount)
+        assertEquals(listOf(eco.idleDutyCycleMs, eco.idleDutyCycleMs), idleWaits)
+    }
+
+    @Test
+    fun boostMode_backoffUsesLoweredBase_capAndAttemptsUnchanged() {
+        val bridge = FakeBridge().apply { startBrowseResult = false }
+        val delays = mutableListOf<Long>()
+        val slept = mutableListOf<Long>()
+        val transport = newTransport(
+            apiLevel = 34,
+            directory = FakeDirectory(),
+            bridge = bridge,
+            maxRestarts = 2,
+            delays = delays,
+            slept = slept,
+            modePolicy = DiscoveryModePolicy.forMode(FlashDiscoveryMode.BOOST),
+        )
+        runBlocking { transport.startBrowsing() }
+
+        // Attempt budget unchanged (3 initiation attempts); the ACTUAL backoff
+        // sleeps are the provider outputs scaled by the BOOST base (250/1000).
+        assertEquals(3, bridge.browseRequests.size)
+        assertEquals(listOf(250L, 500L), slept)
+        assertEquals(listOf(1_000L, 2_000L), delays) // raw provider outputs, unscaled
+    }
+
+    @Test
+    fun standardMode_backoffUsesDefaultBase_unchanged() {
+        val bridge = FakeBridge().apply { startBrowseResult = false }
+        val delays = mutableListOf<Long>()
+        val slept = mutableListOf<Long>()
+        val transport = newTransport(
+            apiLevel = 34,
+            directory = FakeDirectory(),
+            bridge = bridge,
+            maxRestarts = 1,
+            delays = delays,
+            slept = slept,
+        )
+        runBlocking { transport.startBrowsing() }
+        assertEquals(listOf(1_000L), delays)
+        assertEquals(listOf(1_000L), slept)
+    }
 
     private fun endpointOf(id: String) = FlashDiscoveredEndpoint(
         device = com.transfer.flash.core.common.model.FlashDevice(

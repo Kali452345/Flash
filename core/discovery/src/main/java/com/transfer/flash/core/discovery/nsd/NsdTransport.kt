@@ -15,22 +15,26 @@ import com.transfer.flash.core.common.protocol.FlashProtocol
 import com.transfer.flash.core.common.result.FlashError
 import com.transfer.flash.core.common.result.FlashResult
 import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
+import com.transfer.flash.core.discovery.core.DiscoveryModePolicy
 import com.transfer.flash.core.discovery.core.EndpointDirectory
 import com.transfer.flash.core.discovery.core.FlashAdvertisedIdentity
 import com.transfer.flash.core.discovery.core.FlashRadioTransport
 import com.transfer.flash.core.discovery.core.FlashTransportEvent
+import com.transfer.flash.core.discovery.core.TxtCodec
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.nio.charset.StandardCharsets
 import kotlin.coroutines.coroutineContext
 
@@ -387,41 +391,61 @@ class RealNsdManagerBridge(
 
 /**
  * NSD-side TXT codec. Key set mirrors the concurrent core.TxtCodec contract
- * ({device_id,name,model,proto}) but is deliberately independent so this module
- * compiles regardless of the other agent's delivery status.
- * TODO(unify): fold into core.TxtCodec once both land (noted in logs/progress.md).
+ * ({device_id,name,model,proto,caps,fp8} — P3.5-A2 added `caps`/`fp8`, synced
+ * manually in both codecs). Encode now DELEGATES to [TxtCodec] (trivial
+ * unification, P3.5-B2 session): single size-guarded encoder, no drift risk.
+ * Decode intentionally remains independent: the NSD resolve path needs the
+ * tolerant fallback contract (missing name/proto degrade instead of dropping),
+ * which the strict core codec does not provide.
+ * TODO(unify): narrowed to the DECODE path only; fold once callers can accept
+ * strict decoding (noted in logs/progress.md).
  */
 object NsdTxtCodec {
-    const val KEY_DEVICE_ID = "device_id"
-    const val KEY_NAME = "name"
-    const val KEY_MODEL = "model"
-    const val KEY_PROTO = "proto"
-    val KEYS = listOf(KEY_DEVICE_ID, KEY_NAME, KEY_MODEL, KEY_PROTO)
+    const val KEY_DEVICE_ID = TxtCodec.KEY_DEVICE_ID
+    const val KEY_NAME = TxtCodec.KEY_NAME
+    const val KEY_MODEL = TxtCodec.KEY_MODEL
+    const val KEY_PROTO = TxtCodec.KEY_PROTO
+    const val KEY_CAPS = TxtCodec.KEY_CAPS
+    const val KEY_FP8 = TxtCodec.KEY_FP8
+    val KEYS = listOf(KEY_DEVICE_ID, KEY_NAME, KEY_MODEL, KEY_PROTO, KEY_CAPS, KEY_FP8)
 
-    fun encode(identity: FlashAdvertisedIdentity): LinkedHashMap<String, String> = linkedMapOf(
-        KEY_DEVICE_ID to identity.deviceId.value,
-        KEY_NAME to identity.friendlyName,
-        KEY_MODEL to identity.deviceModel,
-        KEY_PROTO to identity.protocolVersion.toString(),
-    )
+    fun encode(identity: FlashAdvertisedIdentity): LinkedHashMap<String, String> =
+        LinkedHashMap(TxtCodec.encode(identity))
 
     data class ParsedIdentity(
         val deviceId: String?,
         val friendlyName: String?,
         val deviceModel: String?,
         val protocolVersion: Int?,
+        /** Informational only (unauthenticated wire); see FlashAdvertisedIdentity KDoc. */
+        val capabilities: Set<String> = emptySet(),
+        val fingerprintPrefix: String? = null,
     )
 
     /**
      * Tolerant decode: missing/blank device_id yields null deviceId (caller drops the
-     * endpoint — identity-aware filtering, plan C3.2); name/proto fall back gracefully.
+     * endpoint — identity-aware filtering, plan C3.2); name/proto fall back gracefully;
+     * missing caps/fp8 default to emptySet/null (pre-P3.5 advertisers accepted).
      */
     fun decode(attributes: Map<String, String>, fallbackName: String, fallbackProto: Int): ParsedIdentity {
         val deviceId = attributes[KEY_DEVICE_ID]?.trim()?.takeIf { it.isNotEmpty() }
         val name = attributes[KEY_NAME]?.takeIf { it.isNotBlank() } ?: fallbackName
         val model = attributes[KEY_MODEL]?.takeIf { it.isNotBlank() }
         val proto = attributes[KEY_PROTO]?.trim()?.toIntOrNull() ?: fallbackProto
-        return ParsedIdentity(deviceId, name, model, proto)
+        val capabilities = attributes[KEY_CAPS]
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            ?: emptySet()
+        return ParsedIdentity(
+            deviceId = deviceId,
+            friendlyName = name,
+            deviceModel = model,
+            protocolVersion = proto,
+            capabilities = capabilities,
+            fingerprintPrefix = attributes[KEY_FP8]?.trim()?.takeIf { it.isNotEmpty() },
+        )
     }
 }
 
@@ -458,6 +482,11 @@ object NsdRestartPolicy {
  *   monitoring + `discoverServices(NetworkRequest, …)` overload (proper Found/Lost
  *   across Wi-Fi drops, added API 33); API < 34 → legacy discover +
  *   hardened [NsdResolveQueue]. Thresholds documented in [NsdApiThresholds].
+ * - **Modes (P3.5-B2):** [setMode] applies a [DiscoveryModePolicy]: GHOST stops /
+ *   suppresses advertising (startAdvertising becomes a documented no-op), ECO
+ *   duty-cycles browse bursts with idle gaps (wakeable mid-idle), BOOST lowers the
+ *   restart-backoff base; STANDARD/RECEIVE_KIOSK browse continuously (KIOSK's
+ *   `kiosk` flag flows purely via advertised caps from the identity).
  *
  * DEVIATION (documented per task spec): this transport owns an internal
  * `CoroutineScope(SupervisorJob() + dispatcher)` created lazily on first start and
@@ -475,9 +504,25 @@ class NsdTransport(
     private val instancePrefix: String = "Flash",
     private val retryDelayMs: (Int) -> Long = NsdRestartPolicy.exponentialBackoff,
     private val maxBrowsingRestarts: Int = DEFAULT_MAX_RESTARTS,
+    /**
+     * Bound on ECO duty cycles per browse session — determinism hook for JVM
+     * tests (no-op `sleep` would otherwise make the duty loop infinite), exactly
+     * analogous to [maxBrowsingRestarts]. Production default is effectively
+     * unbounded.
+     */
+    private val maxDutyCycles: Int = Int.MAX_VALUE,
+    initialModePolicy: DiscoveryModePolicy = DiscoveryModePolicy.forMode(
+        com.transfer.flash.core.discovery.core.FlashDiscoveryMode.STANDARD,
+    ),
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val timeSourceMs: () -> Long = System::currentTimeMillis,
     private val sleep: suspend (Long) -> Unit = { ms -> delay(ms) },
+    /**
+     * One ECO idle gap; returns TRUE when woken early by [setMode] (immediate
+     * browse resume), FALSE when the full gap elapsed. Injectable for the same
+     * determinism reason as [sleep]; null uses the conflated-channel default.
+     */
+    private val idleWaitOverride: (suspend (Long) -> Boolean)? = null,
     private val logInfo: (String) -> Unit = { Log.i(TAG, it) },
     private val logWarn: (String) -> Unit = { Log.w(TAG, it) },
     bridgeOverride: NsdManagerBridge? = null,
@@ -505,6 +550,25 @@ class NsdTransport(
     @Volatile private var browsing = false
     @Volatile private var restartAttempt = 0
     @Volatile private var advertisedPort: Int = 0
+
+    /**
+     * Active mode policy (P3.5-B2). Defaults to STANDARD at construction so the
+     * transport ALWAYS has a policy even before [setMode] is ever called.
+     * Volatile: read from radio-callback lanes, written by [setMode].
+     */
+    @Volatile private var modePolicy: DiscoveryModePolicy = initialModePolicy
+
+    /** Conflated wake-up signal so ECO idle gaps end immediately on [setMode]. */
+    private val modeChanges = Channel<Unit>(Channel.CONFLATED)
+
+    /** ECO idle wait; test override or conflated-channel default (wake on setMode). */
+    private val idleWait: suspend (Long) -> Boolean =
+        idleWaitOverride ?: { ms -> withTimeoutOrNull(ms) { modeChanges.receive() } != null }
+
+    /** Identity/port retained so exiting GHOST can resume advertising (B2). */
+    @Volatile private var lastAdvertisedIdentity: FlashAdvertisedIdentity? = null
+    @Volatile private var lastAdvertisedPort: Int = 0
+    @Volatile private var dutyCyclesCompleted = 0
 
     /** Reverse map serviceName → deviceId so radio loss can produce typed Lost events. */
     private val deviceIdsByServiceName = HashMap<String, FlashDeviceId>()
@@ -593,8 +657,16 @@ class NsdTransport(
     // -- Advertising (C3.2) ---------------------------------------------------
 
     override suspend fun startAdvertising(port: Int, identity: FlashAdvertisedIdentity): FlashResult<Unit> {
-        ensureScope()
+        lastAdvertisedIdentity = identity
+        lastAdvertisedPort = port
         ownDeviceId = identity.deviceId
+        if (!modePolicy.advertises) {
+            // GHOST (P3.5-B2): deliberate no-op. Success is returned so callers
+            // (e.g. CompositeDiscovery.startAll) do not treat the mode as an
+            // error; nothing is registered with the radio.
+            return FlashResult.Success(Unit)
+        }
+        ensureScope()
         acquireMulticastLockIfNeeded()
 
         val txt = NsdTxtCodec.encode(identity)
@@ -616,6 +688,41 @@ class NsdTransport(
         }
     }
 
+    // -- Mode wiring (P3.5-B2) -------------------------------------------------
+
+    /**
+     * Applies a [DiscoveryModePolicy] live-when-safe:
+     * - advertise toggle takes effect IMMEDIATELY (unadvertise on entering
+     *   GHOST; resume from retained identity on leaving it);
+     * - ECO duty-cycle and BOOST backoff knobs are read at the NEXT browse-loop
+     *   iteration / next backoff computation; an in-progress ECO idle gap is
+     *   cut short via a conflated wake-up so leaving ECO resumes browsing
+     *   immediately.
+     */
+    override suspend fun setMode(policy: DiscoveryModePolicy) {
+        val previous = modePolicy
+        modePolicy = policy
+        modeChanges.trySend(Unit) // wake any in-flight idleWait (no-op if none)
+        if (previous.advertises == policy.advertises) return
+        if (!policy.advertises) {
+            if (advertising) stopAdvertisingInternal()
+        } else if (!advertising) {
+            val identity = lastAdvertisedIdentity ?: return // never advertised; nothing to resume
+            startAdvertising(lastAdvertisedPort, identity)
+        }
+    }
+
+    private fun stopAdvertisingInternal() {
+        runCatching { bridge.unadvertise(advertiseEvents) }
+        advertising = false
+        releaseMulticastLockIfIdle()
+    }
+
+    /** Retry delay honoring the active policy's base (BOOST lowers it, B2). */
+    private fun effectiveRetryDelayMs(attempt: Int): Long =
+        retryDelayMs(attempt) * modePolicy.restartBackoffBaseMs /
+            DiscoveryModePolicy.DEFAULT_BACKOFF_BASE_MS
+
     // -- Continuous browsing (C3.3 + C3.4) ------------------------------------
 
     override suspend fun startBrowsing(): FlashResult<Unit> {
@@ -623,12 +730,19 @@ class NsdTransport(
         ensureScope()
         browsing = true
         restartAttempt = 0
+        dutyCyclesCompleted = 0
         acquireMulticastLockIfNeeded()
         emitState("Starting browse")
         scope?.launch(lane) { browseLoop() }
         return FlashResult.Success(Unit)
     }
 
+    /**
+     * Starts browsing until success — continuously (STANDARD/KIOSK/BOOST) or as
+     * the first burst of the ECO duty cycle ([DiscoveryModePolicy.browseDutyCycleMs]
+     * scan → [DiscoveryModePolicy.idleDutyCycleMs] idle → repeat). Duty-cycle
+     * knobs are read per iteration so [setMode] takes effect at the next phase.
+     */
     private suspend fun browseLoop() {
         while (browsing && coroutineContext.isActive) {
             val request = BrowseRequest(
@@ -637,22 +751,46 @@ class NsdTransport(
             )
             val started = runCatching { bridge.startBrowse(request, browseEvents) }
                 .getOrElse { false }
-            if (started) {
-                restartAttempt = 0
+            if (!started) {
+                logWarn("NSD browse initiation failed; retrying")
+                if (!backoffOrGiveUp()) return
+                continue
+            }
+            restartAttempt = 0
+            val browseMs = modePolicy.browseDutyCycleMs ?: return // continuous mode
+            sleep(browseMs)
+            if (!browsing || !coroutineContext.isActive) return
+            bridge.stopBrowse() // end of scan burst; radio loss callbacks ignored below
+            val idleMs = modePolicy.idleDutyCycleMs
+            emitState("ECO idle for ${idleMs ?: 0}ms")
+            dutyCyclesCompleted += 1
+            val wokeEarly = idleWait(idleMs ?: 0L)
+            if (!browsing) return
+            // Budget consumed AFTER the paired idle so a bounded session always
+            // ends in idle, never mid-presence-gap (burst→idle invariant).
+            if (dutyCyclesCompleted >= maxDutyCycles) {
+                browsing = false
+                releaseMulticastLockIfIdle()
+                emitState("ECO duty-cycle budget exhausted after $dutyCyclesCompleted cycles")
                 return
             }
-            logWarn("NSD browse initiation failed; retrying")
-            if (!backoffOrGiveUp()) return
+            if (!wokeEarly) continue
+            // Mode changed mid-idle: loop re-reads the fresh policy immediately.
         }
     }
 
     /**
-     * One backoff step: consumes an attempt, sleeps per [retryDelayMs], and returns
-     * false when the attempt budget is exhausted (browsing disabled + final state emitted).
+     * One backoff step: consumes an attempt, sleeps per the policy-scaled
+     * [effectiveRetryDelayMs], and returns false when the attempt budget is
+     * exhausted (browsing disabled + final state emitted).
      */
     private suspend fun backoffOrGiveUp(): Boolean {
         restartAttempt += 1
-        val decision = NsdRestartPolicy.computeRestart(restartAttempt, maxBrowsingRestarts, retryDelayMs)
+        val decision = NsdRestartPolicy.computeRestart(
+            restartAttempt,
+            maxBrowsingRestarts,
+            ::effectiveRetryDelayMs,
+        )
         val backoffMs = decision.delayMs
         if (backoffMs == null) {
             browsing = false
@@ -683,6 +821,23 @@ class NsdTransport(
             return
         }
         if (deviceId == ownDeviceId) return // self-advertisement filtered by IDENTITY (C3.2)
+
+        // Pre-directory protocol gate (P3.5-A4): incompatible versions are dropped
+        // BEFORE entering the directory. Tolerance: a MISSING proto falls back to
+        // our version (legacy/foreign advertisers stay visible); an EXPLICIT
+        // different version is a hard drop.
+        val peerProto = parsed.protocolVersion ?: FlashProtocol.VERSION
+        if (!FlashProtocol.isCompatible(peerProto)) {
+            logWarn("Dropping NSD endpoint with proto=$peerProto (want ${FlashProtocol.VERSION}) name=${data.serviceName}")
+            return
+        }
+
+        // Caps are INFORMATIONAL on an unauthenticated wire (RFC 6762): accepted
+        // as-is, logged, never retained on the shared endpoint model. Any
+        // caps-based peer filtering happens at CONNECT time (C3.10 seam).
+        if (parsed.capabilities.isNotEmpty()) {
+            logInfo("Peer capabilities caps=${parsed.capabilities.joinToString(",")} name=${data.serviceName}")
+        }
 
         val hostAddress = data.hostAddress ?: return // unresolved yet; wait for next update
         val endpoint = FlashDiscoveredEndpoint(
@@ -759,6 +914,7 @@ class NsdTransport(
         scope = null
         synchronized(deviceIdsByServiceName) { deviceIdsByServiceName.clear() }
         restartAttempt = 0
+        dutyCyclesCompleted = 0
         return FlashResult.Success(Unit)
     }
 

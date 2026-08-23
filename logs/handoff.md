@@ -1,5 +1,10 @@
 # Current Handoff
 
+## 2026-08-23 - P3.5 A+B2/B3 session note (identity hardening + mode wiring)
+- Landed (NOT yet Gradle-verified — run `testDebugUnitTest` first): TXT `caps`/`fp8` keys (core TxtCodec + NsdTxtCodec mirror; encode delegates to core), `FlashAdvertisedIdentity.capabilities/fingerprintPrefix` (defaulted, backward compatible), pre-directory `proto != FlashProtocol.VERSION` drop in NsdTransport, `FlashRadioTransport.setMode(policy)` default-no-op seam, `NsdTransport.setMode` (GHOST suppresses/resumes advertise; ECO duty loop w/ conflated mid-idle wake; BOOST scales backoff base), `CompositeDiscovery.setMode` fan-out + `discoveryMode: StateFlow` + additive `[MODE] ` status prefix.
+- group/** and settings/** untouched (concurrent agent owns them). No gradle/toml changes. Research citations: logs/progress.md entry 2026-08-23. Design decisions: ADR-013.
+- New tests: TxtCodecTest +7, NsdTransportLogicTest +9, CompositeDiscoveryTest +4 (~+20 expected).
+
 ## Current branch
 `main` — remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
 
@@ -7,7 +12,7 @@
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase P3 (LAN half) COMPLETE (2026-08-22): continuous identity-aware discovery landed — `core/FlashRadioTransport` seam + `FlashAdvertisedIdentity`/events, `StandardEndpointDirectory` (dedup/seen-timestamps/aging diffs), `TxtCodec` ({device_id,name,model,proto} cross-radio contract), `DiscoveryRetryPolicy`, `CompositeDiscovery` (per-radio directories, cross-radio dedup LAN>WFD>AWARE>BLE w/ loss hysteresis, `startAll(port, identity)` = advertise+browse everywhere, `sweep()` 30s grace per ADR-012), `nsd/NsdTransport` (TXT advertise + self-filter C3.2; browse-until-stop w/ capped restarts C3.3; API>=34 ServiceInfoCallback vs <34 hardened resolve-queue split + NetworkRequest-scoped discovery API 33+ per research thresholds in NsdApiLevel.kt). NsdFlashDiscovery untouched (R4). Remaining P3: engine wiring of periodic sweep caller + C3.11 two-phone device battery. Next: P4 (C4 network TLS+resilience) or device battery first — owner's call.**
+**Phase P3.5 COMPLETE (2026-08-23): discovery power-ups landed — (A) identity hardening: caps + fp8 TXT keys (RFC 6763 size-guarded ≤120 chars), version gate pre-directory, spoofing research confirms caps are informational-only w/ real verification at connect time (C3.10 seam); (B) 5 discovery modes (STANDARD/GHOST browse-only/BOOST fast-backoff/ECO duty-cycled 20s-on-100s-off/RECEIVE_KIOSK) via pure DiscoveryModePolicy table + live setMode fan-out, persisted key in DataStore; (C) FlashPeerGroupSession multi-peer orchestrator (per-peer state machine Connecting→Online→Sending→Done/Failed, retry isolation, topology-agnostic per Nearby Connections research); (D) FlashBackgroundService skeleton (`connectedDevice` FGS — no dataSync 6h cap) hosting advertise/browse; (E) debug Dev Console (FLAG_DEBUGGABLE-gated chip in MainActivity → Start/Stop/mode picker/live endpoints/BG-service toggle). Background RECEIVING still blocked on C4/C5/C6. Next: P4 (:core:network TLS+resilience) or C3.11 two-phone battery via the new Dev Console.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -71,10 +76,10 @@
 - None.
 
 ## Last change
-Phase P3 LAN half executed via two parallel research-first subagents (pure-logic core: directory/TXT/retry/composite; Android NSD transport) against lead-written contracts. Lead integration fixes: missing ServiceInfoCallback.onServiceLost() no-arg override + nullable serviceName propagation; missing onSuccess import; five test-side bugs — positional harness getters crossing transports when names reversed, inclusive-grace boundary trips, Found events counted in a Lost-only assertion, stale endpoint data in a canned Updated diff, wrong sweep scenario data.
+Phase P3.5 executed: two parallel research-first subagents (A+B2/B3 transport-side identity+modes; C+B4 group-session+settings) against lead-written contracts (FlashDiscoveryMode, DiscoveryModePolicy), plus lead-built D (manifest FGS `connectedDevice` + FlashBackgroundService + DiscoveryEngineHolder provisional bridge) and E (FlashDevConsoleScreen + debug chip entry). Lead integration fixes: ECO budget check moved after paired idle (burst→idle invariant), NsdTransport required-params wiring in holder, suspend-out-of-synchronized in holder stopAll/startAll, Compose StateFlow-vs-mutableStateOf elvis fallbacks.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); **462 tests / 0 failures** (+49).
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-23); **495 tests / 0 failures** (+33).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -99,7 +104,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Either (owner's call): run the C3.11 two-phone device battery now (cold join / hot leave / Wi-Fi toggle / AP roam; record timings in logs/experiments.md), or proceed to Phase P4 — `:core:network` TLS + resilience (C4.0 research → C4.9)** per `docs/core-upgrade-plan.md`. Engine wiring of the periodic sweep caller lands with C7. Device backlog: SQLCipher encrypted-open smoke; Hilt-graph launch check; UI-040 sound toggle QA; Keystore identity-key generation on device.
+**Owner: run the C3.11 two-phone battery NOW using the Dev Console** (install debug APK on both phones → tap "Dev" chip → Start → verify each phone appears in the other's endpoint list within seconds; exercise join/leave/Wi-Fi-toggle; try GHOST mode = invisible but browsing; record timings in logs/experiments.md). Then **Phase P4 — `:core:network` TLS + resilience (C4.0–C4.9)**, which also unblocks real background receiving (D-skeleton already hosts the engine).
 
 ## 2026-08-22 - P3 NSD session note (agent handoff)
 - LAN MVP networking now has `nsd/NsdTransport.kt` (:core:discovery) implementing FlashRadioTransport C3.2-C3.4 (identity TXT advertise + self-filter, continuous browse w/ capped restarts, API>=34 ServiceInfoCallback vs <34 hardened NsdResolveQueue split, NetworkRequest-scoped discovery API 33+). `NsdFlashDiscovery` untouched (R4). NOT yet Gradle-verified (forbidden session) - run testDebugUnitTest first; tests: nsd/NsdTransportLogicTest.kt (pure-JVM, no coroutines-test dep in module).

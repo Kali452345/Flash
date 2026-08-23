@@ -6,16 +6,28 @@ import com.transfer.flash.core.discovery.FlashDiscoveredEndpoint
 import kotlinx.coroutines.flow.Flow
 
 /**
- * Identity payload a device advertises about itself (plan C3.2).
+ * Identity payload a device advertises about itself (plan C3.2, extended P3.5-A3).
  * Carried in radio-specific form: NSD TXT records today; BLE adv payload /
  * Wi-Fi Aware publish extras later. [deviceModel] feeds the Nearby tab rows;
  * [protocolVersion] lets peers hide incompatible versions pre-connection.
+ *
+ * P3.5 additions (both defaulted so existing callers compile unchanged):
+ * - [capabilities]: capability flags advertised via TXT `caps` (e.g. `kiosk`
+ *   willingness from RECEIVE_KIOSK mode). INFORMATIONAL ONLY on the wire —
+ *   mDNS/DNS-SD is unauthenticated (RFC 6762), so advertised caps are a hint,
+ *   never an access decision; enforcement happens at connect time (C3.10 seam).
+ * - [fingerprintPrefix]: first 8 hex chars of this device's identity
+ *   fingerprint (C2.3). May be absent until pairing lands; peers use it as a
+ *   pre-connection consistency cross-check only (see zeroconf spoofing threat
+ *   model in docs/security notes / plan P3.5 research).
  */
 data class FlashAdvertisedIdentity(
     val deviceId: FlashDeviceId,
     val friendlyName: String,
     val deviceModel: String,
     val protocolVersion: Int,
+    val capabilities: Set<String> = emptySet(),
+    val fingerprintPrefix: String? = null,
 )
 
 /**
@@ -62,4 +74,14 @@ interface FlashRadioTransport {
 
     /** Stops advertising and browsing and releases radio resources. Idempotent. */
     suspend fun stop(): FlashResult<Unit>
+
+    /**
+     * Applies a discovery-mode policy (plan P3.5-B2). Default no-op so radios
+     * that do not support mode tuning (future transports) compile unchanged;
+     * [CompositeDiscovery] fans out blindly to every transport.
+     *
+     * Implementations SHOULD honor: advertise toggle immediately, duty-cycle
+     * and backoff knobs at their next loop iteration (live-when-safe rule).
+     */
+    suspend fun setMode(policy: DiscoveryModePolicy) {}
 }

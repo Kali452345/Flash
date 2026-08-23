@@ -43,6 +43,11 @@ private class FakeTransport(override val transportName: String) : FlashRadioTran
     var browseResult: FlashResult<Unit> = FlashResult.Success(Unit)
     var stopResult: FlashResult<Unit> = FlashResult.Success(Unit)
     var lastIdentity: FlashAdvertisedIdentity? = null
+    val policies = mutableListOf<DiscoveryModePolicy>()
+
+    override suspend fun setMode(policy: DiscoveryModePolicy) {
+        policies += policy
+    }
 
     override suspend fun startAdvertising(port: Int, identity: FlashAdvertisedIdentity): FlashResult<Unit> {
         calls += "advertise:$port"
@@ -335,5 +340,68 @@ class CompositeDiscoveryTest {
         harness = Harness("LAN")
         val result = harness.composite.startAdvertising(40_000)
         assertTrue(result is FlashResult.Failure)
+    }
+
+    // ------------------------------------------------------------------
+    // P3.5-B3: mode fan-out + state reflection
+    // ------------------------------------------------------------------
+
+    @Test
+    fun construction_defaultsToStandardPolicy() = runBlocking {
+        harness = Harness("LAN", "WIFI_DIRECT")
+
+        assertEquals(FlashDiscoveryMode.STANDARD, harness.composite.discoveryMode.value)
+        // Transports were never told anything explicitly; their own constructor
+        // default (STANDARD) matches the composite default.
+        harness.transports.forEach { transport -> assertTrue(transport.policies.isEmpty()) }
+    }
+
+    @Test
+    fun setMode_fansOutPolicyToEveryTransport() = runBlocking {
+        harness = Harness("LAN", "WIFI_DIRECT")
+        harness.composite.startAll(40_000, identity)
+
+        harness.composite.setMode(FlashDiscoveryMode.ECO)
+
+        assertEquals(FlashDiscoveryMode.ECO, harness.composite.discoveryMode.value)
+        harness.transports.forEach { transport ->
+            assertEquals(listOf(DiscoveryModePolicy.forMode(FlashDiscoveryMode.ECO)), transport.policies)
+        }
+    }
+
+    @Test
+    fun setMode_reflectedInStateMessagePrefix_withoutBreakingSuffix() = runBlocking {
+        harness = Harness("LAN")
+        harness.composite.startAll(40_000, identity)
+        assertTrue(harness.composite.state.value.statusMessage.startsWith("[STANDARD] "))
+        assertTrue(harness.composite.state.value.statusMessage.endsWith("Advertising and browsing"))
+
+        harness.composite.setMode(FlashDiscoveryMode.ECO)
+        assertTrue(harness.composite.state.value.statusMessage.startsWith("[ECO] "))
+        assertTrue(harness.composite.state.value.isDiscovering)
+
+        harness.composite.setMode(FlashDiscoveryMode.GHOST)
+        val state = harness.composite.state.value
+        assertTrue(state.statusMessage.startsWith("[GHOST] "))
+        assertFalse(state.isAdvertising) // policy is authoritative, transports no-op Success
+    }
+
+    @Test
+    fun ghostMode_startAll_advertiseSuppressedButBrowsingRuns() = runBlocking {
+        harness = Harness("LAN", "WIFI_DIRECT")
+        harness.composite.setMode(FlashDiscoveryMode.GHOST)
+
+        val result = harness.composite.startAll(40_000, identity)
+
+        assertTrue(result is FlashResult.Success)
+        harness.transports.forEach { transport ->
+            assertTrue("advertise:40000" in transport.calls) // call happened…
+            assertFalse(transport.policies.isEmpty())         // …under GHOST policy
+            assertTrue("browse" in transport.calls)
+        }
+        val state = harness.composite.state.value
+        assertTrue(state.isDiscovering)
+        assertFalse(state.isAdvertising) // composite never claims visibility in GHOST
+        assertTrue(state.statusMessage.startsWith("[GHOST] "))
     }
 }

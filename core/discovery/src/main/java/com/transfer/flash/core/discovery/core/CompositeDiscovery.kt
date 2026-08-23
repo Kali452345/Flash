@@ -111,6 +111,22 @@ class CompositeDiscovery(
     private var advertisedPort: Int = 0
     private var identity: FlashAdvertisedIdentity? = null
 
+    /**
+     * Active discovery mode (P3.5-B3). STANDARD is applied implicitly at
+     * construction — the composite's [currentPolicy] AND every transport's own
+     * default both start at STANDARD (transport setMode is suspend, so an eager
+     * constructor fan-out is impossible); explicit application happens via
+     * [setMode].
+     */
+    private val _discoveryMode = MutableStateFlow(FlashDiscoveryMode.STANDARD)
+
+    /** Current discovery mode; updated by [setMode] before transports are fanned out to. */
+    val discoveryMode: StateFlow<FlashDiscoveryMode> = _discoveryMode
+
+    /** Policy table entry for [_discoveryMode]; single source for state-message logic. */
+    @Volatile private var currentPolicy: DiscoveryModePolicy =
+        DiscoveryModePolicy.forMode(FlashDiscoveryMode.STANDARD)
+
     private val _mergedEvents = MutableSharedFlow<FlashTransportEvent>(
         replay = 0,
         extraBufferCapacity = EXTRA_BUFFER_CAPACITY,
@@ -211,11 +227,22 @@ class CompositeDiscovery(
     // Plan C3.9 contract
     // ---------------------------------------------------------------------
 
+    // ---------------------------------------------------------------------
+    // Plan C3.9 contract
+    // ---------------------------------------------------------------------
+
     /**
      * Advertises AND browses on EVERY transport. Success iff every transport
      * succeeded at both; otherwise Failure(FlashError.Unknown) whose message
      * lists which transports failed and why. Partially-started transports keep
      * running (flags reflect reality) so callers can stopAll() cleanly.
+     *
+     * P3.5-B3: identity is passed through UNCHANGED — it now carries the
+     * A-work additions (capabilities / fingerprintPrefix), which transports
+     * serialize into their radio-specific TXT records themselves. GHOST-mode
+     * transports report their suppressed advertise as Success (documented
+     * no-op) so aggregation stays uniform; [refreshState] consults
+     * [currentPolicy] so `isAdvertising` never claims visibility in GHOST.
      */
     suspend fun startAll(port: Int, identity: FlashAdvertisedIdentity): FlashResult<Unit> {
         this.identity = identity
@@ -242,6 +269,28 @@ class CompositeDiscovery(
         } else {
             FlashResult.Failure(FlashError.Unknown(failures.joinToString(" | ")))
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Discovery modes (P3.5-B3)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Switches the discovery mode: stores the mode's [DiscoveryModePolicy],
+     * fans it out to EVERY transport's [FlashRadioTransport.setMode] (radios
+     * without mode support inherit the interface's no-op default), and reflects
+     * the mode into the status message prefix (e.g. `"[ECO] Advertising and
+     * browsing"`). Existing consumers of [state] keep parsing the suffix
+     * unchanged — the prefix is purely additive.
+     */
+    suspend fun setMode(mode: FlashDiscoveryMode) {
+        currentPolicy = DiscoveryModePolicy.forMode(mode)
+        _discoveryMode.value = mode
+        synchronized(lock) { collectingOrStart() }
+        for (transport in transports) {
+            transport.setMode(currentPolicy)
+        }
+        refreshState()
     }
 
     private data class AgedOut(val deviceId: FlashDeviceId, val serviceName: String?)
@@ -440,7 +489,10 @@ class CompositeDiscovery(
 
     private fun refreshState() = synchronized(lock) {
         val anyBrowsing = browsingByTransport.values.any { it }
-        val anyAdvertising = advertisingByTransport.values.any { it }
+        // GHOST (P3.5-B3): transports report their suppressed advertise as
+        // Success, so the raw flag would over-report visibility. The policy is
+        // authoritative for what the outside world can see.
+        val anyAdvertising = currentPolicy.advertises && advertisingByTransport.values.any { it }
         val message = when {
             anyBrowsing && anyAdvertising -> "Advertising and browsing"
             anyBrowsing -> "Browsing"
@@ -451,7 +503,7 @@ class CompositeDiscovery(
             isDiscovering = anyBrowsing,
             isAdvertising = anyAdvertising,
             advertisedPort = advertisedPort,
-            statusMessage = message,
+            statusMessage = "[${currentPolicy.mode.name}] $message",
         )
     }
 }
