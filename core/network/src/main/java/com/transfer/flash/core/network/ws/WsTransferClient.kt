@@ -4,34 +4,59 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.util.Log
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.transfer.flash.core.network.tls.SecureSocketUpgrader
+import com.transfer.flash.core.network.tls.TlsOptions
 
 /**
  * Opens an outbound WebSocket connection to a peer's [WsTransferServer].
  * Routes through the active Wi-Fi/Ethernet network like `LanConnectionProbe`,
  * so the socket lands on the same LAN interface as the peer.
+ *
+ * Pass a non-null [tls] to upgrade the CONNECT socket to TOFU-pinned TLS via
+ * `SecureSocketUpgrader.wrapClient` BEFORE the WebSocket handshake is sent, so the
+ * HTTP upgrade itself travels encrypted ([TlsOptions.expectedDeviceId] is the peer's
+ * stable id; null fails every handshake closed). The plain streams are never touched
+ * before the wrap (clean-boundary rule, see `SecureSocketUpgrader` KDoc).
+ *
+ * @param context nullable so pure-JVM tests can drive loopback connections; when null the
+ * socket is not pinned to a Wi-Fi/Ethernet network (plain default routing).
  */
 class WsTransferClient(
-    context: Context,
+    context: Context?,
     private val connectionListener: WsConnection.Listener,
+    private val tls: TlsOptions? = null,
 ) {
-    private val connectivityManager =
-        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val connectivityManager = context?.applicationContext
+        ?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
     suspend fun connect(host: String, port: Int): WsConnection = withContext(Dispatchers.IO) {
         val network = findLanNetwork()
-        Log.i(
+        WsLog.i(
             TAG,
-            "WS connecting address=$host:$port network=${network?.networkHandle ?: "default"}",
+            "WS connecting address=$host:$port tls=${tls != null} network=${network?.networkHandle ?: "default"}",
         )
-        val socket = network?.socketFactory?.createSocket() ?: Socket()
+        var socket: Socket = network?.socketFactory?.createSocket() ?: Socket()
         try {
             socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            tls?.let { options ->
+                // Track stream access from this point on; any accidental pre-wrap touch
+                // makes wrapClient fail closed with IllegalStateException.
+                val tracked = SecureSocketUpgrader.withPlainStreamTracking(socket)
+                socket = tracked
+                socket = SecureSocketUpgrader.wrapClient(
+                    tracked,
+                    options.expectedDeviceId,
+                    options.pinVerifier,
+                    options.keyManagers,
+                    options.handshakeTimeoutMs,
+                ).getOrElse { error -> throw error }
+                WsLog.i(TAG, "TLS established cipher=${(socket as javax.net.ssl.SSLSocket).session.cipherSuite}")
+            }
             socket.soTimeout = HANDSHAKE_TIMEOUT_MS
             val key = WebSocketCodec.newClientKey()
             val request = buildString {
@@ -64,7 +89,7 @@ class WsTransferClient(
     }
 
     private fun findLanNetwork(): Network? {
-        return connectivityManager.allNetworks.firstOrNull { network ->
+        return connectivityManager?.allNetworks?.firstOrNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
             capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true ||
                 capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true

@@ -1,6 +1,94 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-23 — Phase P4 part 2: TLS into WS transport + LAN session hardening + DefaultFlashNetwork
+
+### Worked on
+Completed P4 integration: wired the C4.1 TLS layer and resilience components into real transports, and built the first concrete `FlashNetwork` implementation.
+
+### Changed
+- **Stream A (TLS→WS):** `tls/SecureSocketUpgrader` (wrapClient eager-handshake w/ SO_TIMEOUT budget; wrapAccepted server-mode lazy handshake; plain-stream taint-tracking guard), additive `TlsOptions?` on `WsTransferServer`/`WsTransferClient` — entire HTTP-upgrade exchange travels over TLS when enabled; no-TLS callers unchanged (R4). Research: SSLSocket wrap semantics, STARTTLS clean-boundary pitfalls, handshake-timeout mechanism.
+- **Stream B (LAN hardening):** `LanProbeMessages` additive FLASH_ACK/FLASH_DATA frames (byte-compatible); `LanSession` — `frameAcks` flow (SocketWritten per send / PeerAcknowledged on ACK), `sendAwaitAck(timeout)` failing soft without session teardown, HeartbeatTracker-driven dead detection (10s×3 ≈ 30s worst case) closing the socket to unblock readLine, injectable heartbeat intervals + logger seam; `incomingFrames` receive surface so PeerAcknowledged is only emitted for consumed payloads.
+- **Lead: `DefaultFlashNetwork : FlashNetwork`** — composes LanProbeServer (inbound) + LanConnectionProbe (outbound) + SessionHardeningPolicy (cap + duplicate coalescing) + ConnectionHealthAggregator (`connectionHealth`) + ReconnectPolicy + AndroidNetworkWatcher (instant network-available reconnect) + manual `retryConnection()`; `rememberEndpoint()` = C3→C4 route seam; registry eviction only when the REGISTERED session itself disconnects (coalesced-duplicate teardown no longer evicts live sessions).
+- **JVM-testability:** LanProbeServer/LanConnectionProbe/DefaultFlashNetwork log via injectable `LanSessionLogger` (android.util.Log crashes JVM tests); LanConnectionProbe tolerates null Context; loopback composition test drives two DefaultFlashNetwork instances end-to-end (connect → both registries → health Connected → duplicate coalesced → stop → Offline).
+
+### Verification
+- Consolidated build: **575 tests / 0 failures** (+14). Two real networks exchange sessions over loopback in pure-JVM tests.
+- Lead fixes during integration: constructor-resolution cycle in legacy LanSession secondary ctor (deleted — unused); Flow.map-style overload & missing-import fallout; logger threading through probe/server/network chain; snapshot-vs-delta health API alignment; duplicate-close registry eviction bug caught by the new composition test.
+
+### Remaining
+- Device verification of TLS-on-WS + hardened sessions on physical phones (Dev Console path).
+- C4.6 Aware/Direct endpoint acceptance seams land with C3.6–C3.8 radios (P7).
+- C4.8 peer-side ACK senders belong to the messaging engine (C6) — transport side is ready.
+- Next phase: **P5 (:core:transfer chunked multi-stream)** or engine facade pull-forward — owner's call.
+
+### Next AI
+Start P5 per plan §5, or wire DefaultFlashNetwork+discovery into Dev Console as an integration smoke before proceeding. R1 research-first every step.
+
+## 2026-08-23 — P4 part 2 stream B: LAN session hardening + delivery-ACK emission (C4.8 + C4.3 wiring, :core:network/tcp)
+
+### Worked on
+Hardened `LanSession` (tracker-driven heartbeat, reader-unblock-on-dead) and implemented real per-frame delivery ACKs on the LAN TCP transport. Parallel agents own ws/**, tls/** — untouched.
+
+### Research findings (R1)
+- (a) Application-level ack framing for text-line protocols: sender-chosen UUID (`frameId`) echoed by receiver; chat delivery is at-least-once with client dedup when retried via durable outbox, while a single in-call send is at-most-once (retry belongs to C6 outbox). Duplicate acks must be idempotent. Sources: https://sujeet.pro/articles/design-real-time-chat-messaging (at-least-once + client dedup on stable messageId), https://www.techinterview.org/post/3233476407/chat-system-design-delivery-ordering-presence/ (client-generated ID before send; ack chain as separate small frames), https://semicolony.dev/codex/system-design/playbook/chat/ (client_msg_id correlation, resends only from durable layer), https://github.com/anulum/synapse-channel/blob/main/docs/protocol.md (senders dedupe repeated ids rather than treating duplicates as new outcomes).
+- (b) Unblocking a thread blocked in `readLine()`: JDK `Socket.close()` makes ANY thread blocked in I/O on the socket throw `SocketException` — this is the documented cross-thread teardown; `Thread.interrupt()` does not reliably unblock socket reads (platform dependent); `setSoTimeout()` only converts an infinite block into periodic `SocketTimeoutException`s while the half-open session stays alive. Sources: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/net/Socket.html ("Any thread currently blocked in an I/O operation upon this socket will throw"), https://stackoverflow.com/questions/3595926/how-to-interrupt-bufferedreaders-readline, https://stackoverflow.com/questions/1024482/stop-interrupt-threads-blocked-on-waiting-input-from-socket, https://stackoverflow.com/questions/23622839/safely-closing-thread-reading-socket-inputstream-from-a-different-thread.
+  ⇒ DeclareDead closes the socket from the heartbeat coroutine; SoTimeout alone is insufficient because it never tears down and requires loop re-arm handling (which we ALSO added — see below).
+
+### Changed
+- **MODIFIED** `tcp/LanProbeMessages.kt` (additive): `LanProbeAck` + `FLASH_ACK` builder/parser (`version/deviceId/name/frameId`), `LanProbeData` envelope + `FLASH_DATA` builder/parser. All existing frames byte-compatible (R4).
+- **MODIFIED** `tcp/LanSession.kt`:
+  - `override val frameAcks: MutableSharedFlow<FrameAck>` — every successful `send()` emits `FrameAck(UUID, SocketWritten, now)`; parsed peer `FLASH_ACK` emits `PeerAcknowledged`. DROP_OLDEST buffer 64 keeps emission non-suspending.
+  - New `sendAwaitAck(message, timeoutMs = DEFAULT_ACK_TIMEOUT_MS=5000)`: wraps payload in `FLASH_DATA` envelope (fresh UUID), registers waiter in a `ConcurrentHashMap`, completes on matching ACK. Timeout ⇒ `Failure(ConnectionTimeout)` WITHOUT closing session; session death ⇒ fail-fast `PeerUnavailable`.
+  - Read loop: parses `FLASH_DATA` (auto-acks + emits payload on new additive `incomingFrames: SharedFlow<String>`), `FLASH_ACK` (remove-before-fire dedup ⇒ duplicates can't double-complete or double-emit), tolerates `SocketTimeoutException` (probe leaves soTimeout 3–4 s armed; legacy 3 s pings masked it, 10 s tracker cadence would otherwise kill idle-but-healthy sessions).
+  - Heartbeat: replaced blind 3 s fixed loop with `HeartbeatTracker` ticks (tick = interval/4 clamped [5 ms, interval]); Suspect logged, DeclareDead closes with reason "heartbeat timeout". Interval/threshold injectable via NEW defaulted constructor params (`heartbeatIntervalMs = HeartbeatPolicy.DEFAULT_INTERVAL_MS = 10 s`, `heartbeatMissedThreshold = 3`) — old signature still compiles (R4); legacy 3 s cadence available by passing 3000. Choice documented: tracker defaults preferred per C4.3 research (10 s × 3 ≈ 30 s worst-case detection).
+  - New injectable `LanSessionLogger` fun interface (default = android.util.Log.println, behavior identical) so JVM tests avoid "not mocked" without touching gradle files.
+- **NOT MODIFIED** `tcp/LanProbeServer.kt` / `tcp/LanConnectionProbe.kt` — constructor stayed source-compatible via default params (R4 verified by signature review); no behavioral change required.
+- **NEW** test `tcp/LanSessionHardenedTest.kt` (5 tests, JVM loopback, deterministic, well under 15 s): SocketWritten-per-send; two real sessions A→B end-to-end acked send (Success + PeerAcknowledged + payload on B.incomingFrames); ACK timeout keeps session Connected and usable; 3 missed heartbeats (interval=60 ms injected) close with "heartbeat timeout" ~180–250 ms; duplicate FLASH_ACK fires exactly one PeerAcknowledged.
+
+### Deviations / notes for next AI
+- Added additive receive surface `incomingFrames` beyond the letter of the spec: without it the receiver would auto-ack a payload it silently discarded, making PeerAcknowledged semantically dishonest between two real Flash sessions.
+- Chose tracker-default 10 s interval over keeping legacy 3 s cadence (documented in KDoc + protocol.md); old cadence reachable via constructor arg.
+- `sendAwaitAck` payloads are single-line UTF-8 text (existing line-framing constraint); embedded newlines corrupt envelope/payload pairing — documented in KDoc.
+- NOT Gradle-run (forbidden session). Expected: +5 tests green; existing LanProbeMessagesTest unaffected (additive only).
+
+### Verification
+Full code re-read + API-semantics check against JDK Socket contract; build/test run pending owner's consolidated Gradle session.
+
+### Remaining
+- Device verification of heartbeat teardown on real phones (two-device dead-peer scenario).
+- Wire `frameAcks` stages into C6 receipt logic (UI-015 glyphs).
+
+## 2026-08-23 — P4 part 2 stream A: TLS integration into WebSocket transport (C4.1 completion, :core:network)
+
+### Worked on
+Wired the C4.1 TLS layer into the WS transport via a new `SecureSocketUpgrader`, plus additive `TlsOptions` on `WsTransferServer`/`WsTransferClient`. Parallel agent owns tcp/** — untouched.
+
+### Research findings (R1, cited in SecureSocketUpgrader KDoc)
+- (a) `SSLSocketFactory.createSocket(socket, host, port, autoClose)` layers over a CONNECTED socket without reconnecting; host/port are logical only; NO I/O until first use or `startHandshake()` — which is what makes server-side `setUseClientMode(false)` after wrap legal. https://docs.oracle.com/en/java/javase/21/docs/api/java.base/javax/net/ssl/SSLSocketFactory.html + https://developer.android.com/reference/javax/net/ssl/SSLSocketFactory + https://stackoverflow.com/questions/6559859/is-it-possible-to-change-plain-socket-to-sslsocket
+- (b) Clean-boundary rule: ANY pre-wrap plain-stream read/write corrupts the TLS stream / enables plaintext injection; once upgrading, plaintext use must cease entirely. https://duesee.dev/p/avoid-implementing-starttls/ + https://lists.openwall.net/bugtraq/2011/03/07/17 + https://stackoverflow.com/questions/15957198/upgrading-socket-to-sslsocket-with-starttls-recv-failed
+- (c) No portable public per-handshake timeout on SSLSocket; both deprecated `SSLCertificateSocketFactory.getDefault(ms)` and Conscrypt's internal `setHandshakeTimeout` implement it by temporarily swapping SO_TIMEOUT for the handshake then restoring — mechanism adopted here. https://developer.android.com/reference/android/net/SSLCertificateSocketFactory + conscrypt OpenSSLSocketImpl source.
+
+### Changed
+- **NEW** `core/network/.../tls/SecureSocketUpgrader.kt`: suspend `wrapClient(...)` (eager handshake, fail-closed, autoClose=true, SO_TIMEOUT-based timeout), `wrapAccepted(...)` (server mode, LAZY handshake documented, caller can `forceHandshake`), `withPlainStreamTracking(socket)` taint-tracking delegating wrapper + `IllegalStateException` refusal when streams were accessed before wrap (best-effort: JDK Socket exposes no way to detect stream access on foreign implementations — convention enforced otherwise), shared `TlsOptions(pinVerifier, keyManagers, expectedDeviceId, handshakeTimeoutMs)`.
+- **MODIFIED** `ws/WsTransferServer.kt` (+additive `tls: TlsOptions? = null`; accepted sockets are tracked+wrapped BEFORE the WS handshake parses any byte) and `ws/WsTransferClient.kt` (+additive `tls: TlsOptions? = null`; CONNECT socket wrapped BEFORE the WS upgrade is sent). Existing callers compile unchanged (`app/.../WsTransferManager.kt` verified source-compatible).
+- **NEW tests**: `tls/SecureSocketUpgraderTest.kt` (taint-refusal client+server, clean-wrapper accepted, wrong-pin fail-closed with TOFU CertificateException in chain) and `ws/SecureWsTransferLoopbackTest.kt` (full TLS server+client text round-trip through encryption; wrong-pin connect fails closed with cert/handshake indicator asserted from cause chain; no-TLS R4 regression path).
+
+### Deviations / notes for next AI
+- `WsTransferClient` context param widened to `Context?` (source-compatible) so pure-JVM loopback tests can run without an Android Context; null ⇒ default routing instead of Wi-Fi/Ethernet pinning.
+- New internal `WsLog` shim (in WsTransferServer.kt) wraps android.util.Log in try/catch — production behaviour identical, unblocks JVM unit tests since gradle files may not be modified this session (`isReturnDefaultValues` not enabled).
+- TlsOptions field named `expectedDeviceId` (spec draft said `expectedClientDeviceId`) + extra defaulted `handshakeTimeoutMs`.
+- NOT Gradle-run (forbidden session). Expected: ~+7 tests, all existing green.
+
+### Verification
+Code review + API-semantics research only; build/test run pending owner's consolidated Gradle session.
+
+### Remaining
+- Wire TLS into LanSession/LanConnectionProbe (tcp/** — concurrent agent), C4.8 real ack emission, device verification of TLS path.
+
+### Next AI
+Run testDebugUnitTest; then integrate WsTransferServer/Client TlsOptions at engine wiring (:app/:core:engine) using AndroidKeyStore KeyManagers + Room-backed FlashPinVerifier.
+
 ## 2026-08-23 — Stale-peer fix + Phase P4 part 1 (:core:network TLS + resilience logic)
 
 ### Worked on

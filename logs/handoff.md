@@ -1,5 +1,16 @@
 # Current Handoff
 
+## 2026-08-23 - P4 part 2 stream B session note (LAN session hardening + delivery ACKs, C4.8/C4.3 in tcp/**)
+- Landed (NOT yet Gradle-verified): `LanSession` now emits real FrameAcks (`frameAcks: MutableSharedFlow` — SocketWritten per successful send, PeerAcknowledged on parsed `FLASH_ACK`), new `sendAwaitAck(message, timeoutMs=5000)` via additive `FLASH_DATA`/`FLASH_ACK` frames (protocol.md updated; existing frames byte-compatible), HeartbeatTracker-driven dead-peer detection (10 s × 3 ≈ 30 s, injectable constructor params, DeclareDead closes socket to unblock blocked readLine — JDK close() contract), read loop now tolerates probe leftover soTimeout. New injectable `LanSessionLogger` (JVM-test seam). Additive receive surface `incomingFrames: SharedFlow<String>`.
+- New test `tcp/LanSessionHardenedTest.kt`: +5 JVM loopback tests incl. two-real-session end-to-end acked send and duplicate-ACK dedup.
+- LanProbeServer/LanConnectionProbe UNTOUCHED (constructor stayed source-compatible). ws/**, tls/**, gradle untouched. Gradle NOT run.
+- Research citations: logs/progress.md entry 2026-08-23 (stream B).
+
+## 2026-08-23 - P4 part 2 stream A session note (TLS into WS transport, C4.1 completion)
+- Landed (NOT yet Gradle-verified): `tls/SecureSocketUpgrader.kt` (wrapClient eager+fail-closed / wrapAccepted lazy server mode / forceHandshake / withPlainStreamTracking taint guard enforcing the clean-boundary rule) + additive `TlsOptions?` on WsTransferServer & WsTransferClient — TLS wrap happens BEFORE the WS handshake bytes flow in both directions. Tests: tls/SecureSocketUpgraderTest + ws/SecureWsTransferLoopbackTest (~+7 expected).
+- Deviations: client context param now `Context?` (JVM-testable loopback); internal `WsLog` try/catch shim around android.util.Log (gradle untouchable this session); field name `expectedDeviceId`. tcp/** untouched; gradle untouched; Gradle NOT run.
+- Research citations: logs/progress.md entry 2026-08-23 (stream A).
+
 ## 2026-08-23 - P3.5 A+B2/B3 session note (identity hardening + mode wiring)
 - Landed (NOT yet Gradle-verified — run `testDebugUnitTest` first): TXT `caps`/`fp8` keys (core TxtCodec + NsdTxtCodec mirror; encode delegates to core), `FlashAdvertisedIdentity.capabilities/fingerprintPrefix` (defaulted, backward compatible), pre-directory `proto != FlashProtocol.VERSION` drop in NsdTransport, `FlashRadioTransport.setMode(policy)` default-no-op seam, `NsdTransport.setMode` (GHOST suppresses/resumes advertise; ECO duty loop w/ conflated mid-idle wake; BOOST scales backoff base), `CompositeDiscovery.setMode` fan-out + `discoveryMode: StateFlow` + additive `[MODE] ` status prefix.
 - group/** and settings/** untouched (concurrent agent owns them). No gradle/toml changes. Research citations: logs/progress.md entry 2026-08-23. Design decisions: ADR-013.
@@ -12,7 +23,7 @@
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Stale-peer bug FIXED + Phase P4 part 1 COMPLETE (2026-08-23): discovery sweeper now automatic (5 s loop in CompositeDiscovery — peers vanish ~30-35 s after departure even without goodbyes). P4: TLS layer (`tls/` — TofuX509TrustManager SPKI pinning, FlashTlsContextFactory, pin-verifier seam for Room store) + resilience logic (`resilience/` — full-jitter ReconnectPolicy, 10s×3 HeartbeatTracker, reject-newest BoundedSendQueue, SessionHardeningPolicy, ConnectionHealthAggregator, Chaos harness with invariant tests) + AndroidNetworkWatcher instant-reconnect trigger. 561 tests / 0 failures. NEXT: P4 part 2 — wire TLS+resilience into REAL sessions (LanSession/WsConnection), C4.8 real ack emission, C4.4 lifecycle binding; or owner runs Dev Console two-phone battery (stale-peer fix needs on-device confirmation).**
+**Phase P4 COMPLETE (2026-08-23): network layer hardened — part 1 (TLS TOFU pinning `tls/`, resilience logic `resilience/`, AndroidNetworkWatcher) + part 2 integration (`SecureSocketUpgrader` + TLS-enabled WsTransferServer/Client; LanSession frameAcks + sendAwaitAck + HeartbeatTracker dead-detection; **DefaultFlashNetwork** first concrete FlashNetwork composing server/probe/sessions/hardening/health/reconnect with `rememberEndpoint()` C3→C4 seam). 575 tests / 0 failures. NEXT: P5 (:core:transfer chunked multi-stream, C5.1–C5.7) — or wire DefaultFlashNetwork+discovery into the Dev Console as an on-device smoke first. Background receiving now unblocked at transport level (C5/C6 pipelines remain).**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -76,10 +87,10 @@
 - None.
 
 ## Last change
-Stale-peer fix (automatic sweeper in CompositeDiscovery, regression-tested with virtual-time latch harness) + P4 part 1 via two parallel research-first subagents against lead contracts (FlashConnectionHealth/FlashNetwork.connectionHealth/retryConnection/FlashSession.frameAcks). Lead integration fixes: javax KeyManager import; BouncyCastle bcpkix test-only route (hand-rolled DER produced malformed certs); PKCS12-backed real KeyManagers in TestIdentity; CN normalization; onKeyChanged threading through factory; fail-closed test restructure; chaos storm assertion arithmetic.
+P4 part 2: two parallel subagents (TLS→WS integration; LAN session hardening+acks) + lead-built DefaultFlashNetwork composition. Lead integration fixes: LanSession legacy secondary-ctor resolution cycle (deleted); injectable LanSessionLogger threaded through probe/server/network (android.util.Log crashes JVM tests); LanConnectionProbe null-context tolerance; duplicate-close registry eviction bug caught by the new loopback composition test; snapshot health API alignment.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-23); **561 tests / 0 failures** (+65). ERROR-008 E:-drive incidents recurring; use --no-daemon --no-configuration-cache when the config cache gets poisoned.
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-23); **575 tests / 0 failures** (+14).
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -104,7 +115,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Owner: run the C3.11 two-phone battery NOW using the Dev Console** (install debug APK on both phones → tap "Dev" chip → Start → verify each phone appears in the other's endpoint list within seconds; exercise join/leave/Wi-Fi-toggle; try GHOST mode = invisible but browsing; record timings in logs/experiments.md). Then **Phase P4 — `:core:network` TLS + resilience (C4.0–C4.9)**, which also unblocks real background receiving (D-skeleton already hosts the engine).
+**Execute Phase P5 — `:core:transfer` chunked multi-stream (C5.1 relocate WsTransferManager → C5.7 multi-stream pipelines)** per `docs/core-upgrade-plan.md`. Optional pre-step: wire DefaultFlashNetwork + CompositeDiscovery into the Dev Console as an on-device integration smoke. Device backlog: TLS-on-WS + hardened-session verification; stale-peer fix confirmation; SQLCipher encrypted-open smoke; Hilt-graph launch check; UI-040 sound QA.
 
 ## 2026-08-22 - P3 NSD session note (agent handoff)
 - LAN MVP networking now has `nsd/NsdTransport.kt` (:core:discovery) implementing FlashRadioTransport C3.2-C3.4 (identity TXT advertise + self-filter, continuous browse w/ capped restarts, API>=34 ServiceInfoCallback vs <34 hardened NsdResolveQueue split, NetworkRequest-scoped discovery API 33+). `NsdFlashDiscovery` untouched (R4). NOT yet Gradle-verified (forbidden session) - run testDebugUnitTest first; tests: nsd/NsdTransportLogicTest.kt (pure-JVM, no coroutines-test dep in module).

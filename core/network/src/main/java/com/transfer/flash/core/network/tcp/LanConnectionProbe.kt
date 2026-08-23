@@ -7,7 +7,6 @@ import com.transfer.flash.core.common.annotation.FlashInternalApi
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.util.Log
 import com.transfer.flash.core.common.model.FlashDevice
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.common.model.FlashTransportType
@@ -20,12 +19,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class LanConnectionProbe(
-    context: Context,
+    context: Context?,
     private val localDeviceId: String,
     private val localFriendlyName: String,
+    private val logger: com.transfer.flash.core.network.tcp.LanSessionLogger = com.transfer.flash.core.network.tcp.LanSessionLogger.ANDROID,
 ) {
+    /** Null on JVM test environments; [findLanNetwork] then yields the default socket. */
     private val connectivityManager =
-        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        context?.applicationContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
     suspend fun probe(hostAddress: String, port: Int, peerDeviceId: String? = null): Result<LanProbeHello> =
         probeEndpoint(hostAddress, port, peerDeviceId)
@@ -35,7 +36,7 @@ class LanConnectionProbe(
             session.close("Probe complete")
             session.peerInfo
         }.onSuccess {
-            Log.i(TAG, "LAN probe connected address=$hostAddress:$port peerId=${it.deviceId}")
+            logger.log(LanSessionLogger.INFO, TAG, "LAN probe connected address=$hostAddress:$port", null)
         }
     }
 
@@ -47,10 +48,12 @@ class LanConnectionProbe(
     ): Result<LanSession> = withContext(Dispatchers.IO) {
         runCatching {
             val network = findLanNetwork()
-            Log.i(
+            logger.log(
+                LanSessionLogger.INFO,
                 TAG,
                 "LAN probe connecting address=$hostAddress:$port " +
                     "deviceId=${peerDeviceId ?: "unknown"} network=${network?.networkHandle ?: "default"}",
+                null,
             )
             val socket = createSocket(network)
             socket.connect(InetSocketAddress(hostAddress, port), CONNECT_TIMEOUT_MS)
@@ -72,19 +75,22 @@ class LanConnectionProbe(
                 localFriendlyName = localFriendlyName,
                 peerInfo = parsed,
                 onDisconnected = onDisconnected,
+                logger = logger,
             ).also { it.start() }
         }.onFailure { error ->
-            Log.w(TAG, "LAN probe failed address=$hostAddress:$port", error)
+            logger.log(LanSessionLogger.WARN, TAG, "LAN probe failed address=$hostAddress:$port", error)
         }
     }
 
     suspend fun notifyDisconnect(hostAddress: String, port: Int, peerDeviceId: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val network = findLanNetwork()
-            Log.i(
+            logger.log(
+                LanSessionLogger.INFO,
                 TAG,
                 "LAN disconnect notifying address=$hostAddress:$port " +
                     "deviceId=${peerDeviceId ?: "unknown"} network=${network?.networkHandle ?: "default"}",
+                null,
             )
             createSocket(network).use { socket ->
                 socket.connect(InetSocketAddress(hostAddress, port), CONNECT_TIMEOUT_MS)
@@ -94,7 +100,7 @@ class LanConnectionProbe(
                 writer.println(LanProbeMessages.disconnect(PROTOCOL_VERSION, localDeviceId, localFriendlyName))
             }
         }.onFailure { error ->
-            Log.w(TAG, "LAN disconnect notify failed address=$hostAddress:$port", error)
+            logger.log(LanSessionLogger.WARN, TAG, "LAN disconnect notify failed address=$hostAddress:$port", error)
         }
     }
 
@@ -103,6 +109,7 @@ class LanConnectionProbe(
     }
 
     private fun findLanNetwork(): Network? {
+        if (connectivityManager == null) return null
         return connectivityManager.allNetworks.firstOrNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
             capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true ||

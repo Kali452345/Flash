@@ -2,7 +2,6 @@
 
 package com.transfer.flash.core.network.tcp
 
-import android.util.Log
 import com.transfer.flash.core.common.annotation.FlashInternalApi
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -24,6 +23,7 @@ class LanProbeServer(
     private val friendlyName: String,
     private val onPeerProbed: (LanProbeHello, String, LanSession) -> Unit = { _, _, _ -> },
     private val onPeerDisconnected: (LanProbeHello) -> Unit = {},
+    private val logger: com.transfer.flash.core.network.tcp.LanSessionLogger = com.transfer.flash.core.network.tcp.LanSessionLogger.ANDROID,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val running = AtomicBoolean(false)
@@ -45,7 +45,7 @@ class LanProbeServer(
         acceptJob = scope.launch {
             acceptLoop(socket)
         }
-        Log.i(TAG, "LAN probe server listening on port=${socket.localPort}")
+        logger.log(LanSessionLogger.INFO, TAG, "LAN probe server listening on port=${socket.localPort}", null)
         socket.localPort
     }
 
@@ -65,7 +65,7 @@ class LanProbeServer(
                 continue
             } catch (error: Exception) {
                 if (running.get()) {
-                    Log.w(TAG, "LAN probe accept failed", error)
+                    logger.log(LanSessionLogger.WARN, TAG, "LAN probe accept failed", error)
                 }
                 break
             }
@@ -86,14 +86,14 @@ class LanProbeServer(
             val disconnect = line?.let(LanProbeMessages::parseDisconnect)
             if (disconnect != null) {
                 onPeerDisconnected(disconnect)
-                Log.i(TAG, "LAN peer disconnected peerId=${disconnect.deviceId} peerName=${disconnect.friendlyName}")
+                logger.log(LanSessionLogger.INFO, TAG, "LAN peer disconnected peerId=${disconnect.deviceId}", null)
                 client.close()
                 return@withContext
             }
 
             val hello = line?.let(LanProbeMessages::parseHello)
             if (hello == null) {
-                Log.w(TAG, "LAN probe rejected malformed hello from ${client.inetAddress.hostAddress}")
+                logger.log(LanSessionLogger.WARN, TAG, "LAN probe rejected malformed hello", null)
                 client.close()
                 return@withContext
             }
@@ -108,9 +108,9 @@ class LanProbeServer(
                 onDisconnected = { peer, _ -> onPeerDisconnected(peer) },
             ).also { it.start() }
             onPeerProbed(hello, client.inetAddress.hostAddress.orEmpty(), session)
-            Log.i(TAG, "LAN probe completed peerId=${hello.deviceId} peerName=${hello.friendlyName}")
+            logger.log(LanSessionLogger.INFO, TAG, "LAN probe completed peerId=${hello.deviceId}", null)
         } catch (error: Exception) {
-            Log.w(TAG, "LAN probe client handling failed", error)
+            logger.log(LanSessionLogger.WARN, TAG, "LAN probe client handling failed", error)
             runCatching { client.close() }
         }
     }
@@ -118,7 +118,7 @@ class LanProbeServer(
     private fun createServerSocket(): ServerSocket {
         return runCatching { ServerSocket(DEFAULT_PORT) }
             .onFailure { error ->
-                Log.w(TAG, "Default LAN probe port=$DEFAULT_PORT unavailable, falling back to dynamic port", error)
+                logger.log(LanSessionLogger.WARN, TAG, "Default LAN probe port unavailable; using dynamic port", error)
             }
             .getOrElse { ServerSocket(0) }
     }
