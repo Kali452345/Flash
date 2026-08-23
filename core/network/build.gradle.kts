@@ -55,4 +55,8 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
+    // TEST-ONLY: self-signed cert generation for JVM handshake tests (C4.1).
+    // Production certs come from the Android platform keystore (docs/security.md
+    // §2) — bouncycastle never ships in the AAR/APK.
+    testImplementation(libs.bouncycastle.pkix)
 }

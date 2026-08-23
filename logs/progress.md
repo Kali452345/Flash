@@ -1,6 +1,30 @@
 # Progress Log
 # Progress Log
 
+## 2026-08-23 — Stale-peer fix + Phase P4 part 1 (:core:network TLS + resilience logic)
+
+### Worked on
+Fixed the field-reported discovery bug (peers stayed visible after stop/Wi-Fi-off), then executed P4 steps C4.1 + C4.2/C4.3/C4.5/C4.7-aggregation + C4.9 via two parallel research-first subagents plus lead contracts/integration.
+
+### Changed
+- **Stale-peer fix (`2c1909d`):** CompositeDiscovery now owns an internal sweeper loop (5 s interval, started by startAll, cancelled by stopAll) so departed peers converge to Lost within ~grace+interval even when mDNS goodbyes are missed; injectable delayFn + maxSweepLoops determinism hooks; regression test drives virtual time through AtomicLong clock.
+- **C4 contracts (lead):** `FlashConnectionHealth` enum; additive `FlashNetwork.connectionHealth`/`retryConnection()`; additive `FlashSession.frameAcks: Flow<FrameAck>` (SocketWritten/PeerAcknowledged stages feeding UI-015).
+- **C4.1 TLS (agent):** `tls/` package — `FlashPinVerifier` seam (Room store wired later), `TofuX509TrustManager` (X509ExtendedTrustManager, SHA-256 SPKI pinning, fail-closed incl. missing device id, uniform onKeyChanged reporting), `FlashTlsContextFactory` (client/server contexts w/ KeyManager injection + onKeyChanged threading, TLSv1.3-preferred config), hostname-verification-replacement rationale documented.
+- **C4.2/C4.3/C4.5/C4.7/C4.9 resilience (agent):** `resilience/` package — full-jitter-with-floor `ReconnectPolicy` (AWS blog research), 10s×3-miss `HeartbeatTracker`, reject-newest `BoundedSendQueue` (capacity 64; outbox retains rejected writes per C6 contract), `SessionHardeningPolicy` (8-session cap, transport-rank coalescing), `ConnectionHealthAggregator`, `ChaosSession`+`ChaosNetworkHarness` fault-injection with resilience invariant tests (dedup gate, queue-full storm under watchdog, dead-peer declaration, reconnect reset).
+- **Lead additions:** `AndroidNetworkWatcher` (NetworkCallback instant-reconnect trigger, LAN transports only); test-only BouncyCastle bcpkix dependency for JVM cert generation (documented decision: zero production footprint — prod certs come from platform keystore).
+
+### Verification
+- Consolidated build: **561 tests / 0 failures** (+65: localhost TLS handshakes matching/wrong/missing pin, TLS 1.3 negotiation, chaos invariants, policy tables).
+- Lead integration fixes (7): javax.net.ssl.KeyManager import; BC test route after hand-rolled DER encoder produced malformed certs ("Too short"); TestIdentity API compat + REAL PKCS12-backed KeyManagers (empty managers broke server-side handshakes); CN double-prefix normalization; factory now threads onKeyChanged (was silently dropped → empty key-change events); trust-manager test restructured to expect the fail-closed exception before asserting callback; chaos storm assertion corrected to reject-all-500.
+- Multiple ERROR-008 E:-drive incidents again (AsyncCacheAccessDecoratedCache write failures killing daemons/config cache); recovered via --stop + fresh no-daemon runs each time.
+
+### Remaining (P4 part 2)
+- Wire TLS factories + resilience components into REAL sessions (LanSession/WsConnection/LanConnectionProbe): C4.5 session-manager integration, C4.6 Aware/Direct endpoint acceptance seams, C4.8 real ack emission, C4.4 foreground-lifecycle binding at :app layer.
+- Device verification of TLS on physical phones.
+
+### Next AI
+P4 part 2 integration, or owner runs Dev Console two-phone battery first. R1 research-first every step.
+
 ## 2026-08-22 - Phase P3 partial: NSD continuous transport (C3.2-C3.4)
 
 ### Worked on
@@ -2118,3 +2142,39 @@ sd/NsdTransport.kt — NsdTxtCodec: keys synced incl. caps/fp8; **encode now del
 
 ### Next AI
 Run testDebugUnitTest; fix reds + log ERROR-0XX. Do not touch group/** or settings/** (concurrent agent). When wiring UI mode switcher, consume CompositeDiscovery.discoveryMode + parse state suffix after the [MODE]  prefix if needed.
+
+## 2026-08-23 — P4 pure-logic agent (C4.2/C4.3/C4.5/C4.7-aggregation + C4.9 chaos)
+
+### Worked on
+Resilience primitives + chaos harness for `:core:network`, all NEW files only (no existing file touched, no gradle/toml change, Gradle NOT run per session rules).
+
+### Research findings (R1, cited)
+- (a) Backoff+jitter: AWS "Exponential Backoff and Jitter" https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/ — Full jitter ≈ Decorrelated completion time with LESS client work; decorrelated only wins under sustained overload; Brooker https://brooker.co.za/blog/2022/08/11/backoff.html ; simulator reference https://github.com/aws-samples/aws-arch-backoff-simulator . CHOICE: full jitter WITH floor `base + rand*(min(cap, base*2^attempt) − base)` (floor = minimum P2P retry spacing; herd de-sync preserved).
+- (b) Heartbeat/dead-peer: TCP keepalive defaults 2h first probe and answers at OS layer (zombie-blind) → app-level ping/pong required: https://dev.to/137foundry/why-application-level-heartbeats-beat-tcp-keepalive-for-websockets-1bfl ; websocket.org timeout guide: missed-counter pattern, "3 missed is a reasonable default", 25s interval guidance: https://websocket.org/guides/troubleshooting/timeout/ ; chat presence systems use 10–15s heartbeats, offline after 2–3 misses: https://websocket.org/guides/use-cases/chat/ . CHOICE: intervalMs=10_000, missedThreshold=3 (P2P has no proxy idle timeout → bias fast detection; worst-case declaration 30s).
+- (c) Bounded-queue backpressure: reject-newest/fail-fast correct when every item matters and caller has fallback; drop-oldest only when newest invalidates oldest (video/sensors); block risks deadlock on dead peers: https://unseel.com/cs/backpressure ; https://www.techinterview.org/post/3233468900/lld-backpressure/ ; https://letsbuildsolutions.com/blog/system-design/back-pressure-in-distributed-systems-flow-control-patterns-that-prevent-cascading-overload/ . CHOICE: REJECT (typed Rejected(QueueFull|Closed), outbox retains write per C6 contract).
+
+### Changed (all under ownership paths only)
+- main `resilience/ReconnectPolicy.kt` — pure delayForAttempt(attempt[, random01]) + stateful nextDelay()/reset() (stable-connect reset), giveUpAfterMs nullable (null=infinite, P2P semantics), overflow-guarded bounds.
+- main `resilience/HeartbeatPolicy.kt` (+10s/3 defaults w/ citations), `HeartbeatTracker.kt` — Alive/Suspect/Dead, onPingSent/onPongReceived/onTick(nowMs)→PingNow|AwaitPong|DeclareDead; exactly-at-threshold inclusive boundary; Dead terminal.
+- main `resilience/BoundedSendQueue.kt` — capacity 64 default, Enqueued|Rejected, poll/drainInto/awaitDrained/close, ReentrantLock thread-safe.
+- main `resilience/SessionHardeningPolicy.kt` — maxConcurrentSessions=8; resolveDuplicate(existingRank,newRank): strictly-lower wins, tie keeps existing; ranks LAN0>Direct1>WS2>relay/mesh(+future BLE-presence)3>unknown99 mirroring C3 priority.
+- main `resilience/ConnectionHealthAggregator.kt` — MutableStateFlow holder (coroutines available transitively via lifecycle-runtime-ktx — verified LanSession already uses it); resolve(): sessions beat attempts beat peer-count; Connected when ≥1 healthy & none degraded; mixed healthy+degraded→Connected (documented precedence); Degraded only when ALL degraded.
+- main `resilience/ChaosSession.kt` + `ChaosNetworkHarness.kt` — seeded drop/dup/reorder-window/delay/disconnect faults over FlashSession delegate; DedupGate helper; harness composes queue+tracker+policy.
+- tests `resilience/` — ReconnectPolicyTest (seeded distribution bounds incl. cap/clamp/give-up/reset-replay), HeartbeatTrackerTest (boundary ticks incl. exactly-at-threshold, pong-reset, Dead-terminal), BoundedSendQueueTest (overflow, FIFO, closed-drainable, 4-producer/1-consumer smoke w/ per-stream FIFO check), SessionHardeningPolicyTest (ties, rank order, unknown-never-wins), ConnectionHealthAggregatorTest (precedence matrix + holder flow), ChaosResilienceTest (invariants i–iv + mid-drain outbox retention). All deterministic JVM tests, explicit nowMs / seeded rng / injected random01; NO coroutines-test dependency (runBlocking only, from transitive coroutines-core).
+
+### Verification
+- NOT Gradle-verified this session (forbidden). Logic traced by hand against contracts read first: FlashConnectionHealth enum values, FlashSession+FrameAck, FlashNetwork.connectionHealth/retryConnection, LanSession/WsConnection skim.
+
+### Deviations
+1. Full-jitter variant uses a BASE FLOOR (task spec range `[base, min(cap, base*2^attempt)]`) vs canonical AWS `[0, bound]` — spec-compliant and justified above.
+2. Chaos inbound enters via explicit deliverInbound() because FlashSession exposes no inbound hook by design (reads live in transport loops like LanSession.readLoop).
+3. Harness requeueAtHead shim added so failed sends retain FIFO order inside the harness (production wiring will own this via the real session manager).
+4. Mixed healthy+degraded sessions map to Connected (spec left mixed case open; any healthy path dominates — documented in KDoc).
+
+### Remaining
+- Owner runs testDebugUnitTest (~+30 tests expected); fix reds + ERROR-0XX if any.
+- C4.2/C4.3 engine WIRING into FlashNetwork impls (these are the pure primitives; integration step separate).
+- C4.4 lifecycle binding, C4.6 endpoint plumbing untouched (not in scope).
+
+### Next AI
+Read docs/core-upgrade-plan.md C4 + this entry; wire primitives into the concrete FlashNetwork implementation behind connectionHealth; do NOT modify resilience/** APIs without reading their KDoc rationale.

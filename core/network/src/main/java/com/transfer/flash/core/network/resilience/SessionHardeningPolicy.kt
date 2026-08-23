@@ -1,0 +1,85 @@
+package com.transfer.flash.core.network.resilience
+
+import com.transfer.flash.core.common.model.FlashTransportType
+
+/**
+ * Decision when a second session for an already-connected device arrives
+ * (plan C4.5 / upgrade 6 duplicate-peer coalescing).
+ */
+enum class DuplicateSessionDecision {
+    /** Keep the current session; reject/ignore the newcomer. */
+    KeepExisting,
+
+    /** The newer connection rides a richer path — migrate to it. */
+    PreferNew,
+}
+
+/**
+ * Pure session-manager hardening rules (plan C4.5 / upgrades 5–6).
+ *
+ * - [maxConcurrentSessions] = 8: bounds socket/fd/thread pressure on a phone
+ *   while covering realistic group sizes for v1 (direct P2P only, D5 mesh is
+ *   post-v1).
+ * - Transport ranks mirror the discovery priority order (C3.9 "prefers LAN"):
+ *   a LOWER rank number = richer path. LAN(0) > Wi-Fi Direct(1) >
+ *   WebSocket(2) > relay-class paths(3). BLE presence transport (C3.8,
+ *   signals-only, no data in v1) will occupy rank 3 alongside relay-class
+ *   paths. [TRANSPORT_RANK_UNKNOWN] = 99 so an unidentified path never wins.
+ *
+ * Tie behavior: **keep existing**. Equal richness means migration would cost
+ * a reconnect handshake and risk frame loss across the swap with zero path
+ * improvement; stability wins.
+ *
+ * Pure logic — no sockets, no state; the owning session manager applies these
+ * decisions atomically around its own lock.
+ */
+class SessionHardeningPolicy(
+    val maxConcurrentSessions: Int = DEFAULT_MAX_CONCURRENT_SESSIONS,
+) {
+    init {
+        require(maxConcurrentSessions >= 1) { "maxConcurrentSessions must be >= 1" }
+    }
+
+    /**
+     * Admission rule: true when one more session fits under the concurrency
+     * limit given [activeCount].
+     */
+    fun canAcceptSession(activeCount: Int): Boolean = activeCount < maxConcurrentSessions
+
+    /**
+     * Coalescing decision between an existing session's transport rank and a
+     * new candidate's. Strictly-lower new rank wins ([DuplicateSessionDecision.PreferNew]);
+     * equal or worse keeps the incumbent (documented tie behavior).
+     */
+    fun resolveDuplicate(existingTransportRank: Int, newTransportRank: Int): DuplicateSessionDecision =
+        if (newTransportRank < existingTransportRank) {
+            DuplicateSessionDecision.PreferNew
+        } else {
+            DuplicateSessionDecision.KeepExisting
+        }
+
+    /** Convenience overload resolving ranks from [FlashTransportType]. */
+    fun resolveDuplicate(
+        existingTransport: FlashTransportType,
+        newTransport: FlashTransportType,
+    ): DuplicateSessionDecision =
+        resolveDuplicate(transportRank(existingTransport), transportRank(newTransport))
+
+    companion object {
+        const val DEFAULT_MAX_CONCURRENT_SESSIONS: Int = 8
+
+        const val TRANSPORT_RANK_LAN: Int = 0
+        const val TRANSPORT_RANK_WIFI_DIRECT: Int = 1
+        const val TRANSPORT_RANK_WEBSOCKET: Int = 2
+        const val TRANSPORT_RANK_RELAY_CLASS: Int = 3 // relay/mesh/BLE-presence (post-v1 paths)
+        const val TRANSPORT_RANK_UNKNOWN: Int = 99
+
+        fun transportRank(transport: FlashTransportType): Int = when (transport) {
+            FlashTransportType.LAN -> TRANSPORT_RANK_LAN
+            FlashTransportType.WIFI_DIRECT -> TRANSPORT_RANK_WIFI_DIRECT
+            FlashTransportType.WEBSOCKET -> TRANSPORT_RANK_WEBSOCKET
+            FlashTransportType.RELAY, FlashTransportType.MESH -> TRANSPORT_RANK_RELAY_CLASS
+            FlashTransportType.UNKNOWN -> TRANSPORT_RANK_UNKNOWN
+        }
+    }
+}

@@ -12,7 +12,7 @@
 `testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase P3.5 COMPLETE (2026-08-23): discovery power-ups landed — (A) identity hardening: caps + fp8 TXT keys (RFC 6763 size-guarded ≤120 chars), version gate pre-directory, spoofing research confirms caps are informational-only w/ real verification at connect time (C3.10 seam); (B) 5 discovery modes (STANDARD/GHOST browse-only/BOOST fast-backoff/ECO duty-cycled 20s-on-100s-off/RECEIVE_KIOSK) via pure DiscoveryModePolicy table + live setMode fan-out, persisted key in DataStore; (C) FlashPeerGroupSession multi-peer orchestrator (per-peer state machine Connecting→Online→Sending→Done/Failed, retry isolation, topology-agnostic per Nearby Connections research); (D) FlashBackgroundService skeleton (`connectedDevice` FGS — no dataSync 6h cap) hosting advertise/browse; (E) debug Dev Console (FLAG_DEBUGGABLE-gated chip in MainActivity → Start/Stop/mode picker/live endpoints/BG-service toggle). Background RECEIVING still blocked on C4/C5/C6. Next: P4 (:core:network TLS+resilience) or C3.11 two-phone battery via the new Dev Console.**
+**Stale-peer bug FIXED + Phase P4 part 1 COMPLETE (2026-08-23): discovery sweeper now automatic (5 s loop in CompositeDiscovery — peers vanish ~30-35 s after departure even without goodbyes). P4: TLS layer (`tls/` — TofuX509TrustManager SPKI pinning, FlashTlsContextFactory, pin-verifier seam for Room store) + resilience logic (`resilience/` — full-jitter ReconnectPolicy, 10s×3 HeartbeatTracker, reject-newest BoundedSendQueue, SessionHardeningPolicy, ConnectionHealthAggregator, Chaos harness with invariant tests) + AndroidNetworkWatcher instant-reconnect trigger. 561 tests / 0 failures. NEXT: P4 part 2 — wire TLS+resilience into REAL sessions (LanSession/WsConnection), C4.8 real ack emission, C4.4 lifecycle binding; or owner runs Dev Console two-phone battery (stale-peer fix needs on-device confirmation).**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` — two-pane not yet consumed by screens (integration pending).
@@ -76,10 +76,10 @@
 - None.
 
 ## Last change
-Phase P3.5 executed: two parallel research-first subagents (A+B2/B3 transport-side identity+modes; C+B4 group-session+settings) against lead-written contracts (FlashDiscoveryMode, DiscoveryModePolicy), plus lead-built D (manifest FGS `connectedDevice` + FlashBackgroundService + DiscoveryEngineHolder provisional bridge) and E (FlashDevConsoleScreen + debug chip entry). Lead integration fixes: ECO budget check moved after paired idle (burst→idle invariant), NsdTransport required-params wiring in holder, suspend-out-of-synchronized in holder stopAll/startAll, Compose StateFlow-vs-mutableStateOf elvis fallbacks.
+Stale-peer fix (automatic sweeper in CompositeDiscovery, regression-tested with virtual-time latch harness) + P4 part 1 via two parallel research-first subagents against lead contracts (FlashConnectionHealth/FlashNetwork.connectionHealth/retryConnection/FlashSession.frameAcks). Lead integration fixes: javax KeyManager import; BouncyCastle bcpkix test-only route (hand-rolled DER produced malformed certs); PKCS12-backed real KeyManagers in TestIdentity; CN normalization; onKeyChanged threading through factory; fail-closed test restructure; chaos storm assertion arithmetic.
 
 ## Last test
-`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-23); **495 tests / 0 failures** (+33).
+`testDebugUnitTest assembleDebug` — BUILD SUCCESSFUL (2026-08-23); **561 tests / 0 failures** (+65). ERROR-008 E:-drive incidents recurring; use --no-daemon --no-configuration-cache when the config cache gets poisoned.
 
 ## Known blockers
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
@@ -146,3 +146,9 @@ $env:JAVA_HOME="E:\AndroidDev\AndroidStudio\android-studio\jbr"; $env:PATH="$env
 - CompositeDiscovery implements existing FlashDiscovery + `startAll(port, identity)` aggregate + `sweep(nowMs, grace=30_000)` + `mergedEvents` SharedFlow(DROP_OLDEST); dedup across transports by deviceId, priority LAN > WIFI_DIRECT > WIFI_AWARE > BLE, loss hysteresis emits Updated(fallback) not Lost while a lower radio still sees the peer.
 - Deterministic tests without coroutines-test: synchronous DirectDispatcher injected via optional scopeFactory ctor param + explicit clock lambda + local FakeTransport.
 - NOT Gradle-verified (forbidden session) - run testDebugUnitTest first; expect ~+25 tests. Full details + research URLs: logs/progress.md entry of this date; decisions: ADR-010.
+
+## 2026-08-23 - P4 pure-logic agent (C4.2/C4.3/C4.5/C4.7-aggregation + C4.9)
+- Created ONLY: `core/network/.../resilience/**` (ReconnectPolicy, HeartbeatPolicy, HeartbeatTracker, BoundedSendQueue, SessionHardeningPolicy, ConnectionHealthAggregator, ChaosSession+DedupGate, ChaosNetworkHarness) + matching tests under src/test. NO existing file or gradle/toml touched; Gradle NOT run.
+- Strategies chosen (research-cited in logs/progress.md same date): full-jitter-with-floor backoff base 1s cap 30s; heartbeat 10s interval / 3 misses; send-queue REJECT mode capacity 64; session limit 8; duplicate-device tie keeps existing.
+- Deterministic JVM tests only (explicit nowMs, seeded Random, injected random01); no coroutines-test. MutableStateFlow used in main via transitive coroutines-core (lifecycle-runtime-ktx) - verified.
+- NOT build-verified. Next AI: run testDebugUnitTest first (~+30 expected), then wire primitives into concrete FlashNetwork impls (C4.2/C4.3 integration).
