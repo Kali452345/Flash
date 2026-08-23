@@ -237,7 +237,8 @@ class MultiStreamDispatcher(
 
     private suspend fun runChannel(channelId: Int, channel: StreamChannel) {
         while (true) {
-            val frame = claimNextChunk(channelId) ?: return
+            val frame = claimNextChunk(channelId)
+            if (frame == null) return
             // Count BEFORE the send: the receiver's inline ACK feedback can resolve the
             // session inside sendFrame, and completeLocked() snapshots these counters —
             // counting afterwards loses the completing chunk (observed 18 vs 19).

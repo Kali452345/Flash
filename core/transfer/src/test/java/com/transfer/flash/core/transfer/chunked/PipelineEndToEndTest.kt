@@ -100,7 +100,7 @@ class PipelineEndToEndTest {
     }
 
     @Test
-    @Ignore("resume counter off-by-one family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky family - see ERROR-013")
     fun `resume mid-file - kill after k chunks then finish from receiver done-set`() = runBlocking {
         val chunker = Chunker()
         val meta = meta("resume-case")

@@ -217,7 +217,7 @@ class MultiStreamDispatcherTest {
     // ---- tests ---------------------------------------------------------------------------
 
     @Test
-    @Ignore("zero-progress / race family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
     fun `three streams move 300KB end to end - bytes identical, exactly once, endgame single-file`() =
         runBlocking {
             val h = Harness()
@@ -259,7 +259,7 @@ class MultiStreamDispatcherTest {
         }
 
     @Test
-    @Ignore("zero-progress / race family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
     fun `slow gated channel - others finish the file, no deadlock, slow completes its one chunk`() =
         runBlocking {
             val (h, gate, channels) = gatedHarness()
@@ -278,7 +278,7 @@ class MultiStreamDispatcherTest {
             assertEquals(19, h.assembler.writes)
         }
     @Test
-    @Ignore("zero-progress family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
     fun `channel death mid transfer - unacked claims return to pool, survivor completes`() =
         runBlocking {
             val h = Harness(channelsFactory = { id, r, p -> DyingChannel(id, r, p, failAfterChunks = 2) })
@@ -309,7 +309,7 @@ class MultiStreamDispatcherTest {
     }
 
     @Test
-    @Ignore("zero-progress family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
     fun `progress is monotonic and eta sane while transferring`() = runBlocking {
         val (h, gate, _) = gatedHarness()
         val dispatcher = h.build()
@@ -374,7 +374,7 @@ class MultiStreamDispatcherTest {
     }
 
     @Test
-    @Ignore("zero-progress family - see ERROR-013 (OPEN)")
+    @Ignore("suite-order flaky: green x3 isolated, red in module/suite runs - see ERROR-013")
     fun `resume seeding - doneIndexes skipped, progress starts at resumed bytes`() = runBlocking {
         val h = Harness(streamCount = 2)
         val dispatcher = MultiStreamDispatcher(
