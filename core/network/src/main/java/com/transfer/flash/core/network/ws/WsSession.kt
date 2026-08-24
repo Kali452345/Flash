@@ -1,5 +1,6 @@
 package com.transfer.flash.core.network.ws
 
+import android.util.Log
 import com.transfer.flash.core.common.model.FlashDevice
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.common.model.FlashTransportType
@@ -11,12 +12,16 @@ import com.transfer.flash.core.network.FrameAck
 import com.transfer.flash.core.network.FrameAckStage
 import java.util.UUID
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.trySendBlocking
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.consumeAsFlow
 
 /**
  * FlashSession implementation backed by an active RFC 6455 [WsConnection].
@@ -24,12 +29,21 @@ import kotlinx.coroutines.flow.asStateFlow
  * Supports:
  * - Direct UTF-8 text messages (JSON chat frames / control signaling)
  * - Raw binary messages (file chunk frames)
- * - Automatic Keepalive via WebSocket ping/pong
- * - Instant disconnect event forwarding
+ * - Keepalive handled by [WsConnection] (periodic pings + read-timeout dead detection)
+ * - Immediate disconnect event forwarding
+ *
+ * ## Delivery guarantees (fix for silent-frame-drop stalls)
+ *
+ * Inbound frames are delivered through bounded [Channel]s whose senders BLOCK when full
+ * (`trySendBlocking`). Because sends happen on the WS read-loop thread, a slow consumer
+ * (e.g. disk-bound chunk writes) blocks the read loop, which applies TCP backpressure to
+ * the peer — chunks are never silently discarded (the previous `DROP_OLDEST` SharedFlow
+ * dropped CHUNK frames that were never ACKed, permanently stalling transfers).
  */
 class WsSession(
     val connection: WsConnection,
     override val peer: FlashDevice,
+    private val logTag: String = TAG,
     private val onDisconnected: (WsSession, String) -> Unit = { _, _ -> },
 ) : FlashSession {
 
@@ -46,19 +60,22 @@ class WsSession(
     )
     override val frameAcks: SharedFlow<FrameAck> = _frameAcks.asSharedFlow()
 
-    private val _incomingText = MutableSharedFlow<String>(
-        replay = 0,
-        extraBufferCapacity = 64,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-    val incomingText: SharedFlow<String> = _incomingText.asSharedFlow()
+    private val textChannel = Channel<String>(capacity = TEXT_BUFFER_FRAMES)
+    private val binaryChannel = Channel<ByteArray>(capacity = BINARY_BUFFER_FRAMES)
 
-    private val _incomingBinary = MutableSharedFlow<ByteArray>(
-        replay = 0,
-        extraBufferCapacity = 64,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-    val incomingBinary: SharedFlow<ByteArray> = _incomingBinary.asSharedFlow()
+    /** Single-consumer flows: exactly one collector per session is expected (engine wiring). */
+    val incomingText: Flow<String> = textChannel.consumeAsFlow()
+    val incomingBinary: Flow<ByteArray> = binaryChannel.consumeAsFlow()
+
+    /**
+     * Pulls the next inbound binary frame directly (manual receive loop). Used by hosts that
+     * need to gate intake (e.g. pause-via-backpressure) between frames; throws
+     * ClosedReceiveChannelException once the connection closed and buffers drained.
+     */
+    suspend fun awaitBinaryFrame(): ByteArray = binaryChannel.receive()
+
+    /** Pulls the next inbound text frame directly; see [awaitBinaryFrame]. */
+    suspend fun awaitTextFrame(): String = textChannel.receive()
 
     override suspend fun send(message: ByteArray): FlashResult<Unit> {
         val ok = connection.sendBinary(message)
@@ -83,19 +100,43 @@ class WsSession(
     override fun disconnect(reason: String) {
         _connectionState.value = FlashConnectionState.Disconnected
         connection.close(reason)
+        closeChannels()
         onDisconnected(this, reason)
     }
 
     fun onTextReceived(text: String) {
-        _incomingText.tryEmit(text)
+        val result = textChannel.trySendBlocking(text)
+        if (result.isFailure && !result.isClosed) {
+            Log.w(logTag, "WS text frame dropped (buffer full) peer=${peer.friendlyName}")
+        }
     }
 
     fun onBinaryReceived(data: ByteArray) {
-        _incomingBinary.tryEmit(data)
+        val result = binaryChannel.trySendBlocking(data)
+        if (result.isFailure && !result.isClosed) {
+            Log.w(logTag, "WS binary frame dropped (buffer full) peer=${peer.friendlyName}")
+        }
     }
 
     fun onClosed(reason: String) {
         _connectionState.value = FlashConnectionState.Disconnected
+        closeChannels()
         onDisconnected(this, reason)
+    }
+
+    private fun closeChannels() {
+        textChannel.close()
+        binaryChannel.close()
+    }
+
+    companion object {
+        private const val TAG = "WS"
+
+        /**
+         * Binary buffer sized so a burst of chunk frames survives a brief consumer hiccup
+         * while still bounding memory (~128 x 64 KB = 8 MB at default chunk size).
+         */
+        const val BINARY_BUFFER_FRAMES = 128
+        const val TEXT_BUFFER_FRAMES = 512
     }
 }

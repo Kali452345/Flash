@@ -38,8 +38,11 @@ interface StreamChannel {
  * dispatch starts; returning **null** means "cannot open more streams" and that slot is simply
  * skipped — the transfer proceeds with however many channels opened successfully (>= 1 required,
  * otherwise the transfer fails immediately).
+ *
+ * [peerDeviceId] is the intended recipient (when known, null otherwise) so factories can route
+ * every channel of this session to the correct peer instead of an arbitrary live one.
  */
 fun interface StreamChannelFactory {
 
-    suspend fun open(channelId: Int): StreamChannel?
+    suspend fun open(channelId: Int, peerDeviceId: String?): StreamChannel?
 }

@@ -12,6 +12,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -19,7 +20,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -65,6 +68,8 @@ class MultiStreamDispatcher(
     private val onCompleteFrame: ((ByteArray) -> Unit)? = null,
     /** Local-coverage fallback delay before resolving without the receiver COMPLETE frame. */
     private val completeGraceMs: Long = DEFAULT_COMPLETE_GRACE_MS,
+    /** Intended recipient device id, forwarded to [StreamChannelFactory.open] for peer routing. */
+    private val peerDeviceId: String? = null,
 ) {
     init {
         require(streamCount in 1..MAX_STREAMS) { "streamCount must be in 1..$MAX_STREAMS" }
@@ -97,6 +102,8 @@ class MultiStreamDispatcher(
     @Volatile private var receiverVerifiedField: Boolean? = null
     @Volatile private var coverageReachedAtMs: Long? = null
     @Volatile private var resolvedDigest: String = ""
+    /** Set once all workers exited while uncovered; deadline after which un-ACKed work fails. */
+    @Volatile private var ackDrainDeadlineMs: Long? = null
 
     // Terminal bookkeeping: tiny critical sections, never held across I/O.
     private val terminalLock = Any()
@@ -108,9 +115,34 @@ class MultiStreamDispatcher(
     private val completeEmittedOnce = AtomicBoolean(false)
     @Volatile private var completeFrameBytesHolder: ByteArray? = null
 
+    /**
+     * Cooperative pause (application-level flow control, ADR-018): when true, workers and the
+     * materializer park before their next chunk. Unlike job cancellation this survives blocking
+     * socket writes and is reversible via [setPaused](resume) — the receiver's PAUSE control
+     * frame flips this on the sender within one poll interval.
+     */
+    @Volatile private var externallyPaused = false
+
+    /** Streams actually opened for this session (set in send()); used for all-dead checks. */
+    @Volatile private var plannedStreams: Int = 0
+
     private data class PreparedFrame(val index: Int, val frameBytes: ByteArray)
 
     // ---- public API ------------------------------------------------------------------------------
+
+    /**
+     * Application-level pause/resume of chunk transmission. Instant and reversible; the transfer
+     * stays fully assembled (feeds intact) so resume continues exactly where it stopped.
+     */
+    fun setPaused(paused: Boolean) {
+        externallyPaused = paused
+    }
+
+    private suspend fun awaitUnpause() {
+        while (externallyPaused && currentCoroutineContext().isActive) {
+            delay(PAUSE_POLL_MS)
+        }
+    }
 
     /**
      * Runs the entire multi-stream transfer. Single-use. Inbound receiver feedback (`ACK_BATCH`
@@ -131,9 +163,13 @@ class MultiStreamDispatcher(
 
             val effectiveStreams = streamCount.coerceIn(1, pendingIndexes.size)
             aliveWorkers.set(effectiveStreams)
+            plannedStreams = effectiveStreams
 
-            val feeds = List(effectiveStreams) { Channel<PreparedFrame>(Channel.UNLIMITED) }
-            val shared = Channel<PreparedFrame>(Channel.UNLIMITED)
+            // BOUNDED (AGENTS §18): the materializer paces with the network instead of
+            // serializing the whole file into RAM. UNLIMITED queues made every paused/stalled
+            // attempt hold its entire remaining file on the heap → OOM by the third try.
+            val feeds = List(effectiveStreams) { Channel<PreparedFrame>(FEED_BUFFER_FRAMES) }
+            val shared = Channel<PreparedFrame>(SHARED_BUFFER_FRAMES)
             val ownFeedsOpen = AtomicInteger(effectiveStreams)
 
             // Watcher: throttled progress publishing + non-inline resolutions
@@ -153,6 +189,11 @@ class MultiStreamDispatcher(
                     var stream: ChunkStream? = null
                     try {
                         for (index in pendingIndexes) {
+                            // Terminal outcome already reached (receiver COMPLETE, or every
+                            // channel died): stop reading the source instead of serializing the
+                            // rest of the file into queues nobody will send.
+                            if (deferred.isCompleted) break
+                            awaitUnpause()
                             val s = stream ?: chunker.openChunkStream(
                                 source, meta, plan, resolvedDigest,
                             ).also { stream = it }
@@ -182,7 +223,7 @@ class MultiStreamDispatcher(
             // session on FILE_START — chunks arriving first would be rejected UNKNOWN_TRANSFER.
             val channels = (0 until effectiveStreams).map { id ->
                 val channel = try {
-                    factory.open(id)
+                    factory.open(id, peerDeviceId)
                         ?: return@coroutineScope failWith(
                             deferred, "channel factory refused stream $id",
                         )
@@ -226,6 +267,10 @@ class MultiStreamDispatcher(
 
     /** Snapshot: distinct chunk indexes the receiver has confirmed so far. */
     fun confirmedCountSnapshot(): Int = confirmedCount.get()
+
+    /** Snapshot: all receiver-confirmed chunk indexes (resume bit-vector mirror). */
+    fun confirmedIndexesSnapshot(): List<Int> =
+        synchronized(terminalLock) { confirmedVector.doneIndexes() }
 
     /** Snapshot: channel ids marked dead during the session. */
     fun deadChannelsSnapshot(): List<Int> = synchronized(terminalLock) { deadIds.toList() }
@@ -291,8 +336,29 @@ class MultiStreamDispatcher(
             deferred.complete(completed)
             return
         }
-        if (!covered && aliveWorkers.get() == 0) {
-            deferred.complete(failedLocked("all channels failed"))
+        // All workers exited but coverage is incomplete: sends are fire-and-forget (socket
+        // buffer), so ACKs legitimately lag behind worker exit. Wait a bounded grace for the
+        // outstanding ACK_BATCH/COMPLETE before declaring failure — instant failure here
+        // misreported healthy transfers ("all channels failed" at first-ACK ~20%) whenever
+        // the last chunks left the socket buffer after the final worker finished.
+        if (!covered && aliveWorkers.get() <= 0) {
+            // Nothing ever reached a wire (every channel failed on its first frame): there is no
+            // ACK in flight, so waiting out the drain grace would only stall a certain failure.
+            if (chunksSentTotal.get() == 0) {
+                deferred.complete(failedLocked("all channels failed"))
+                return
+            }
+            val now = nowMs()
+            val deadline = synchronized(terminalLock) {
+                (ackDrainDeadlineMs ?: now.also { ackDrainDeadlineMs = it }) + ACK_DRAIN_GRACE_MS
+            }
+            if (now >= deadline) {
+                deferred.complete(
+                    failedLocked(
+                        "ack drain timeout: ${confirmedVector.missingIndexes().size} chunk(s) unconfirmed after all streams exited",
+                    ),
+                )
+            }
         }
     }
 
@@ -341,10 +407,23 @@ class MultiStreamDispatcher(
     // ---- workers -----------------------------------------------------------------------------------
 
     /**
-     * Phase 1 drains this worker's assigned feed. On wire failure the worker marks itself dead,
-     * redistributes the failed frame plus everything left of its assignment into the shared
-     * queue, and exits. Healthy workers drain their feed to natural closure, then help drain
-     * redistributed work until it too closes (last own-feed consumer closes it).
+     * One worker drives exactly one wire.
+     *
+     * It drains its statically-assigned feed and — while its wire is healthy — *concurrently*
+     * helps drain the shared redistribution queue (`select` over both channels). Concurrency here
+     * is a correctness requirement, not an optimisation: with bounded queues a survivor that only
+     * looked at `shared` after exhausting its own assignment would let a dead worker fill `shared`,
+     * stall on it, stop draining its own feed, and block the materializer forever (ERROR-016).
+     *
+     * On wire failure the worker flips to "dead": it stops touching its broken wire but keeps
+     * draining its own feed to closure — so the materializer never blocks on a full feed — and
+     * hands every remaining frame to [redistribute].
+     *
+     * Exit bookkeeping runs in `finally` on EVERY path: the own-feed slot is released (the last
+     * release closes `shared`, which is how survivors learn to stop) and the live-worker count is
+     * decremented exactly once. The first bounded-channel revision skipped both on its early
+     * `return` paths, so `shared` never closed and `aliveWorkers` never hit zero — nothing
+     * resolved and `send()` never returned.
      */
     private suspend fun runWorker(
         id: Int,
@@ -355,81 +434,132 @@ class MultiStreamDispatcher(
         wire: StreamChannel,
         startOk: Boolean,
     ) {
-        var sent = 0
-        var failed = 0
-        // Phase 1: assigned frames. A wire failure flips this worker to "dead": everything
-        // left of its assignment (including the failed frame) redistributes into `shared`,
-        // and it stops touching its broken wire entirely.
         var dead = !startOk
-        if (dead) {
-            synchronized(terminalLock) {
-                if (!deadIds.contains(id)) deadIds.add(id)
-            }
-        }
-        for (prepared in ownFeed) {
-            val ok = if (!dead) {
-                chunksSentTotal.incrementAndGet()
-                bytesSentTotal.addAndGet(chunkBytes(prepared.index))
-                val success = runCatching { wire.sendFrame(prepared.frameBytes) }.getOrDefault(false)
-                if (!success) {
-                    chunksSentTotal.decrementAndGet()
-                    bytesSentTotal.addAndGet(-chunkBytes(prepared.index))
-                }
-                success
-            } else {
-                false
-            }
+        var ownOpen = true
+        var sharedOpen = true
+        var ownFeedReleased = false
+        var aliveReleased = false
 
-            if (ok) {
-                sent++
-            } else {
-                failed++
-                if (!dead) {
-                    dead = true
-                    synchronized(terminalLock) {
-                        if (!deadIds.contains(id)) deadIds.add(id)
-                    }
-                }
-                shared.send(prepared)
+        // Releases this worker's own-feed slot; the last one closes the shared queue.
+        fun releaseOwnFeed() {
+            if (!ownFeedReleased) {
+                ownFeedReleased = true
+                if (ownFeedsOpen.decrementAndGet() == 0) shared.close()
             }
         }
-        if (ownFeedsOpen.decrementAndGet() == 0) {
-            shared.close()
+
+        // Retires this worker as a sender (idempotent), then re-checks all-dead detection.
+        fun releaseAlive() {
+            if (!aliveReleased) {
+                aliveReleased = true
+                aliveWorkers.decrementAndGet()
+                failIfAllChannelsDead(deferred)
+            }
         }
 
         if (dead) {
-            aliveWorkers.decrementAndGet()
-            failIfAllChannelsDead(deferred)
-            return
+            markDead(id)
+            releaseAlive() // FILE_START never landed: this wire can never send.
         }
 
-        // Phase 2: help survivors drain redistributed frames until the shared queue closes
-        // (closed by whichever worker consumed the last own-feed slot).
         try {
-            for (prepared in shared) {
+            while (true) {
+                if (!ownOpen) releaseOwnFeed()
+                val pull = when {
+                    // Healthy: take whichever queue has work first.
+                    ownOpen && sharedOpen && !dead ->
+                        select<Pair<Boolean, ChannelResult<PreparedFrame>>> {
+                            ownFeed.onReceiveCatching { false to it }
+                            shared.onReceiveCatching { true to it }
+                        }
+                    // Dead workers never consume `shared` — they cannot send it onward.
+                    ownOpen -> false to ownFeed.receiveCatching()
+                    sharedOpen && !dead -> true to shared.receiveCatching()
+                    else -> break
+                }
+                val (fromShared, received) = pull
+                val prepared = received.getOrNull()
+                if (prepared == null) { // channel closed and drained
+                    if (fromShared) sharedOpen = false else ownOpen = false
+                    continue
+                }
+
+                awaitUnpause()
+
+                if (dead) {
+                    redistribute(shared, prepared, deferred)
+                    continue
+                }
+
                 chunksSentTotal.incrementAndGet()
                 bytesSentTotal.addAndGet(chunkBytes(prepared.index))
                 val ok = runCatching { wire.sendFrame(prepared.frameBytes) }.getOrDefault(false)
-                if (!ok) {
-                    chunksSentTotal.decrementAndGet()
-                    bytesSentTotal.addAndGet(-chunkBytes(prepared.index))
-                    shared.send(prepared) // hand back; another survivor takes it
-                    aliveWorkers.decrementAndGet()
-                    failIfAllChannelsDead(deferred)
-                    return
-                }
+                if (ok) continue
+
+                chunksSentTotal.decrementAndGet()
+                bytesSentTotal.addAndGet(-chunkBytes(prepared.index))
+                dead = true
+                markDead(id)
+                // Retire the wire before handing the frame back: all-dead detection must see this
+                // channel as gone while we finish draining our assignment.
+                releaseAlive()
+                redistribute(shared, prepared, deferred)
             }
         } finally {
-            aliveWorkers.decrementAndGet()
+            releaseOwnFeed()
+            releaseAlive()
         }
+    }
+
+    /**
+     * Hands an unsent frame to the shared queue so a survivor can retry it (at-least-once wire,
+     * exactly-once write — the receive pipeline dedups).
+     *
+     * Never blocks indefinitely: `shared` is bounded, so a full queue is polled only while a live
+     * channel could still drain it. Once every channel is dead, the queue is closed, or the
+     * transfer has resolved, the frame is dropped and terminal resolution reports it unconfirmed —
+     * blocking there would deadlock, because the only possible consumers are already gone.
+     */
+    private suspend fun redistribute(
+        shared: Channel<PreparedFrame>,
+        prepared: PreparedFrame,
+        deferred: CompletableDeferred<MultiStreamResult>,
+    ) {
+        while (true) {
+            val result = shared.trySend(prepared)
+            if (result.isSuccess || result.isClosed) return
+            if (!shouldRedistribute(deferred)) return
+            delay(REDISTRIBUTE_POLL_MS)
+        }
+    }
+
+    private fun markDead(id: Int) {
+        synchronized(terminalLock) {
+            if (!deadIds.contains(id)) deadIds.add(id)
+        }
+    }
+
+    /**
+     * True while handing work to the bounded shared queue can still pay off: the transfer is
+     * unresolved and at least one live worker remains to drain it.
+     */
+    private fun shouldRedistribute(deferred: CompletableDeferred<MultiStreamResult>): Boolean {
+        if (deferred.isCompleted) return false
+        if (aliveWorkers.get() <= 0) return false
+        val allDead = synchronized(terminalLock) {
+            (0 until plannedStreams).all { deadIds.contains(it) }
+        }
+        return !allDead
     }
 
     private fun failIfAllChannelsDead(deferred: CompletableDeferred<MultiStreamResult>) {
         val alive = aliveWorkers.get()
         if (alive == 0 && !deferred.isCompleted) {
-            val covered = confirmedCount.get() >= plan.totalChunks
-            if (!covered) {
-                deferred.complete(failedLocked("all channels failed"))
+            // Do NOT fail instantly: sends are fire-and-forget, ACKs lag behind worker exit.
+            // Arm the bounded ack-drain deadline; the watcher resolves (covered → Completed,
+            // expiry → ack-drain-timeout failure).
+            synchronized(terminalLock) {
+                if (ackDrainDeadlineMs == null) ackDrainDeadlineMs = nowMs()
             }
         }
     }
@@ -454,8 +584,24 @@ class MultiStreamDispatcher(
         @Suppress("UNUSED")
         const val END_GAME_CHUNKS = 8
 
+        /** Bounded per-feed queue depth — constant memory regardless of file size (AGENTS §18). */
+        const val FEED_BUFFER_FRAMES = 8
+        const val SHARED_BUFFER_FRAMES = 32
+
+        /** Cooperative-pause poll cadence (ms). */
+        const val PAUSE_POLL_MS = 25L
+
+        /** Retry cadence while the bounded shared queue is full (ERROR-016). */
+        const val REDISTRIBUTE_POLL_MS = 5L
+
         const val WATCH_POLL_MS = 10L
         const val DEFAULT_COMPLETE_GRACE_MS = 2_000L
+
+        /**
+         * Grace after the last worker exits for outstanding ACK_BATCH/COMPLETE frames to
+         * arrive. Covers normal socket-buffer drain lag plus receiver disk-write pacing.
+         */
+        const val ACK_DRAIN_GRACE_MS = 15_000L
     }
 }
 

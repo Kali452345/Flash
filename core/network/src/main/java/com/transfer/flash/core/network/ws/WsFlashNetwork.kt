@@ -19,6 +19,7 @@ import com.transfer.flash.core.network.FlashSession
 import com.transfer.flash.core.network.bridge.EndpointMemory
 import com.transfer.flash.core.network.tls.TlsOptions
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -58,6 +59,14 @@ class WsFlashNetwork(
     private val sessionsById = ConcurrentHashMap<FlashDeviceId, WsSession>()
     private val sessionByConnection = ConcurrentHashMap<WsConnection, WsSession>()
     private val pendingHandshakes = ConcurrentHashMap<WsConnection, CompletableDeferred<FlashDevice>>()
+
+    /**
+     * Frames that arrive on a connection AFTER its HELLO completed but BEFORE the local
+     * [WsSession] is registered (the peer may start streaming immediately after ITS
+     * registration). They are buffered per connection and flushed into the session on
+     * registration instead of being silently dropped (fix for early-frame race).
+     */
+    private val earlyFrames = ConcurrentHashMap<WsConnection, ConcurrentLinkedQueue<Any>>()
 
     private data class Endpoint(val host: String, val port: Int)
 
@@ -101,10 +110,14 @@ class WsFlashNetwork(
         server?.stop()
         server = null
 
+        // Pending handshakes hold live sockets with active read loops — close, don't just forget.
+        pendingHandshakes.keys.forEach { it.close("Network stopped") }
+        pendingHandshakes.clear()
+        earlyFrames.clear()
+
         sessionsById.values.forEach { it.disconnect("Network stopped") }
         sessionsById.clear()
         sessionByConnection.clear()
-        pendingHandshakes.clear()
 
         _activeSessions.value = emptyMap()
         _connectionHealth.value = FlashConnectionHealth.Offline
@@ -119,6 +132,10 @@ class WsFlashNetwork(
     override fun rememberEndpoint(deviceId: String, host: String, port: Int) {
         knownEndpoints[deviceId] = Endpoint(host, port)
     }
+
+    /** Resolved endpoint for a discovered peer (host + WS port), or null when unknown. */
+    fun endpointOf(deviceId: String?): Pair<String, Int>? =
+        deviceId?.let { id -> knownEndpoints[id]?.let { it.host to it.port } }
 
     // ------------------------------------------------------------------
     // Connect / Disconnect
@@ -157,15 +174,30 @@ class WsFlashNetwork(
         connection.sendText(helloMsg)
 
         // Wait for peer HELLO response
-        val peerDevice = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
-            handshakeWaiter.await()
+        val handshakeOutcome = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+            runCatching { handshakeWaiter.await() }
         }
 
         pendingHandshakes.remove(connection)
+        earlyFrames.remove(connection)
 
-        if (peerDevice == null) {
-            connection.close("Handshake timeout")
-            return@withContext FlashResult.Failure(FlashError.ConnectionTimeout(HANDSHAKE_TIMEOUT_MS, "WS handshake timed out"))
+        val peerDevice = when {
+            // Timed out waiting for the peer HELLO.
+            handshakeOutcome == null -> {
+                connection.close("Handshake timeout")
+                return@withContext FlashResult.Failure(
+                    FlashError.ConnectionTimeout(HANDSHAKE_TIMEOUT_MS, "WS handshake timed out"),
+                )
+            }
+            // Peer rejected our HELLO (e.g. protocol version mismatch) and closed.
+            handshakeOutcome.isFailure -> {
+                val cause = handshakeOutcome.exceptionOrNull()
+                connection.close("Handshake rejected")
+                return@withContext FlashResult.Failure(
+                    FlashError.PeerUnavailable(host, cause?.message ?: "Handshake rejected"),
+                )
+            }
+            else -> handshakeOutcome.getOrThrow()
         }
 
         val session = WsSession(connection, peerDevice) { s, _ ->
@@ -195,13 +227,16 @@ class WsFlashNetwork(
         connection.start()
 
         scope.launch {
-            val peerDevice = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
-                handshakeWaiter.await()
+            val outcome = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                runCatching { handshakeWaiter.await() }
             }
             pendingHandshakes.remove(connection)
 
-            if (peerDevice == null) {
-                connection.close("Inbound handshake timeout")
+            if (outcome?.isSuccess != true) {
+                connection.close(
+                    if (outcome == null) "Inbound handshake timeout"
+                    else "Inbound handshake rejected: ${outcome.exceptionOrNull()?.message}",
+                )
                 return@launch
             }
 
@@ -214,7 +249,7 @@ class WsFlashNetwork(
             )
             connection.sendText(helloReply)
 
-            val session = WsSession(connection, peerDevice) { s, _ ->
+            val session = WsSession(connection, outcome.getOrThrow()) { s, _ ->
                 onSessionDisconnected(s)
             }
             registerSession(session)
@@ -222,15 +257,35 @@ class WsFlashNetwork(
     }
 
     private fun registerSession(session: WsSession) {
-        sessionsById[session.peerDeviceId] = session
+        // Connect glare (both peers dial simultaneously): the newer session wins; the replaced
+        // one is closed so its socket/read loop cannot keep pumping duplicate frames.
+        val replaced = sessionsById.put(session.peerDeviceId, session)
+        if (replaced != null && replaced !== session) {
+            sessionByConnection.remove(replaced.connection)
+            replaced.disconnect("Replaced by newer session")
+        }
         sessionByConnection[session.connection] = session
+
+        // Flush any frames that arrived between handshake completion and registration.
+        earlyFrames.remove(session.connection)?.let { queued ->
+            queued.forEach { frame ->
+                when (frame) {
+                    is String -> session.onTextReceived(frame)
+                    is ByteArray -> session.onBinaryReceived(frame)
+                }
+            }
+        }
+
         _activeSessions.value = sessionsById.toMap()
         refreshState()
     }
 
     private fun onSessionDisconnected(session: WsSession) {
-        sessionsById.remove(session.peerDeviceId)
-        sessionByConnection.remove(session.connection)
+        // Identity-safe removal: a glare replacement already re-pointed sessionsById at the
+        // new session — a late callback from the OLD session must not evict it.
+        sessionsById.remove(session.peerDeviceId, session)
+        sessionByConnection.remove(session.connection, session)
+        earlyFrames.remove(session.connection)
         _activeSessions.value = sessionsById.toMap()
         refreshState()
     }
@@ -264,6 +319,14 @@ class WsFlashNetwork(
             val peerName = parsedFields["name"] ?: "Peer"
             val peerVersion = parsedFields["version"]?.toIntOrNull() ?: 1
 
+            if (peerVersion != PROTOCOL_VERSION) {
+                pendingHandshakes[connection]?.completeExceptionally(
+                    IllegalStateException("protocol version mismatch: local=$PROTOCOL_VERSION peer=$peerVersion"),
+                )
+                connection.close("Unsupported protocol version $peerVersion")
+                return
+            }
+
             val peerDevice = FlashDevice(
                 id = FlashDeviceId(peerDeviceId),
                 friendlyName = peerName,
@@ -273,16 +336,27 @@ class WsFlashNetwork(
             )
 
             pendingHandshakes[connection]?.complete(peerDevice)
+        } else {
+            // Not yet registered: buffer instead of dropping (early-frame race).
+            earlyFrameQueue(connection).add(text)
         }
     }
 
     override fun onBinaryMessage(connection: WsConnection, data: ByteArray) {
         val session = sessionByConnection[connection]
-        session?.onBinaryReceived(data)
+        if (session != null) {
+            session.onBinaryReceived(data)
+        } else {
+            earlyFrameQueue(connection).add(data)
+        }
     }
+
+    private fun earlyFrameQueue(connection: WsConnection): ConcurrentLinkedQueue<Any> =
+        earlyFrames.computeIfAbsent(connection) { ConcurrentLinkedQueue() }
 
     override fun onConnectionClosed(connection: WsConnection, reason: String) {
         pendingHandshakes.remove(connection)?.completeExceptionally(Exception("Closed: $reason"))
+        earlyFrames.remove(connection)
         val session = sessionByConnection.remove(connection)
         if (session != null) {
             session.onClosed(reason)

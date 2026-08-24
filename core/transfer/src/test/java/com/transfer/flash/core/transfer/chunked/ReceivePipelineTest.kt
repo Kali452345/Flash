@@ -120,6 +120,7 @@ class ReceivePipelineTest {
         outer@ for (frame in frames) {
             for (event in pipeline.onFrame(ChunkFrame.serialize(frame))) {
                 when (event) {
+                    is ReceiveEvent.SessionStarted -> Unit
                     is ReceiveEvent.AckBatchReady -> batchSizes.add(event.frame.indexes.size)
                     is ReceiveEvent.Completed -> completed = event.frame
                     is ReceiveEvent.Rejected -> throw AssertionError("unexpected rejection $event")

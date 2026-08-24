@@ -18,12 +18,23 @@ import kotlinx.coroutines.launch
  * Reads run on a Dispatchers.IO coroutine; writes are serialized through a lock
  * so file chunks and control frames from different threads can never interleave.
  * Listener callbacks fire on the read thread — implementations must be thread-safe.
+ *
+ * ## Liveness (ADR-016 keepalive)
+ *
+ * A periodic WebSocket PING is sent every [pingIntervalMs]. Combined with the socket
+ * read timeout ([readTimeoutMs], ~3 ping intervals), any connection that receives NO
+ * inbound traffic for that window — including half-open TCP after NAT/idle drops on
+ * mobile hotspots — throws SocketTimeoutException in the read loop and is closed, so
+ * sessions surface disconnects instead of blocking forever. Live peers answer PINGs
+ * with PONGs, which keeps healthy idle connections fresh.
  */
 class WsConnection(
     private val socket: Socket,
     private val maskOutboundFrames: Boolean,
     val remoteLabel: String,
     private val listener: Listener,
+    private val pingIntervalMs: Long = DEFAULT_PING_INTERVAL_MS,
+    private val readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
 ) {
     interface Listener {
         fun onTextMessage(connection: WsConnection, text: String)
@@ -41,7 +52,15 @@ class WsConnection(
         get() = !closed.get()
 
     fun start() {
+        runCatching { socket.soTimeout = readTimeoutMs }
         scope.launch { readLoop() }
+        scope.launch {
+            while (scope.isActive) {
+                kotlinx.coroutines.delay(pingIntervalMs)
+                if (closed.get()) break
+                send(WebSocketCodec.OPCODE_PING, ByteArray(0))
+            }
+        }
     }
 
     fun sendText(text: String): Boolean {
@@ -118,5 +137,9 @@ class WsConnection(
 
     companion object {
         private const val TAG = "WS"
+
+        /** Idle connections are refreshed 3x per read-timeout window (ping -> pong traffic). */
+        const val DEFAULT_PING_INTERVAL_MS = 15_000L
+        const val DEFAULT_READ_TIMEOUT_MS = 45_000
     }
 }

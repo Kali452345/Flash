@@ -74,6 +74,7 @@ class PipelineEndToEndTest {
             val events = receiver.onFrame(wire.removeFirst())
             for (event in events) {
                 when (event) {
+                    is ReceiveEvent.SessionStarted -> Unit
                     is ReceiveEvent.AckBatchReady -> {
                         ackBatches++
                         assertTrue(sender.onFrame(ChunkFrame.serialize(event.frame)))
@@ -150,6 +151,7 @@ class PipelineEndToEndTest {
         while (wire2.isNotEmpty()) {
             for (event in firstReceiver.onFrame(wire2.removeFirst())) {
                 when (event) {
+                    is ReceiveEvent.SessionStarted -> Unit
                     is ReceiveEvent.AckBatchReady ->
                         assertTrue(resumedSender.onFrame(ChunkFrame.serialize(event.frame)))
 

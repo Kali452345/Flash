@@ -1,5 +1,168 @@
 # Progress Log
 
+## 2026-08-24 - Bounded-channel dispatcher hang fixed (ERROR-016) + Gradle unblocked (ERROR-017)
+
+### Worked on
+Cleared the blocker that stopped `:core:transfer:testDebugUnitTest` from ever finishing after the queues in
+`MultiStreamDispatcher` were bounded, and recovered the ability to run Gradle at all in this environment.
+
+### Changed
+- **`MultiStreamDispatcher.runWorker` rewritten (ADR-019):** the two sequential phases (drain own feed, then drain
+  `shared`) collapsed into ONE loop that `select`s over both channels, so a worker keeps draining its own feed while
+  it is also willing to take redistributed work. Dead workers drain their feed but never consume `shared`.
+- **Exit bookkeeping made exactly-once and unconditional:** `releaseOwnFeed()` (last one closes `shared`) and
+  `releaseAlive()` (decrements `aliveWorkers`, then re-runs all-dead detection) are idempotent closures invoked from
+  `finally`, so no early/failure/cancellation path can skip them. Removes the pre-existing double decrement in the
+  old phase-2 failure branch.
+- **Redistribution can no longer pin a worker:** new `redistribute()` uses `trySend` + `delay(REDISTRIBUTE_POLL_MS = 5)`
+  and bails out when the transfer resolved, `shared` closed, or every channel is dead.
+- **Materializer short-circuit:** `if (deferred.isCompleted) break` - stops serializing the rest of the file into
+  queues nobody will drain once the receiver has already resolved the transfer.
+- **Fail fast when nothing reached the wire:** `maybeResolveFromState` fails immediately on
+  `aliveWorkers <= 0 && chunksSentTotal == 0` instead of waiting out the 15 s ACK-drain grace (no ACK can be pending).
+- Bounded queues KEPT (feeds=8, shared=32); the permitted revert-to-`Channel.UNLIMITED` fallback was not needed.
+- **Docs:** ADR-018 (FLASH_XFER wire control plane + cooperative pause) and ADR-019 (single-loop bounded-queue
+  workers) written up in `docs/decisions.md`; ERROR-016 closed with the confirmed root cause; ERROR-017 added for the
+  build-environment failure below.
+
+### Diagnosis (ERROR-016)
+Three compounding defects, one of them device-fatal rather than test-only:
+1. The Phase-1 early `return` skipped BOTH `ownFeedsOpen.decrementAndGet()` (so `shared` never closed and survivors'
+   `for (prepared in shared)` never terminated) AND `aliveWorkers.decrementAndGet()` (so the all-dead arm of
+   `maybeResolveFromState` never fired, the ACK-drain deadline was never armed, and `deferred.await()` hung even
+   after `workers.joinAll()` returned).
+2. Phase 2 decremented `aliveWorkers` inside a `try` whose `finally` decremented it again - counter went negative,
+   `== 0` unreachable.
+3. Structural: phase-separated consumers + a bounded `shared` queue deadlock by construction (dead worker blocks in
+   `shared.send()` -> stops draining its feed -> materializer blocks on that feed -> survivors never reach the phase
+   that would drain `shared`). Unbounded channels merely hid this.
+
+### Build environment (ERROR-017)
+Gradle could not start at all - every invocation, including `gradlew --version`, failed with `Unable to establish
+loopback connection`. Cause: since JDK 19+ every `Selector` is built on a `PipeImpl` that prefers an AF_UNIX socket
+pair on Windows; on this machine AF_UNIX bind succeeds but connect always fails EINVAL, and the JDK only falls back
+to TCP loopback when the BIND throws. Workaround (both JVMs on the box, launcher + daemon + workers):
+`export JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=Z:\nope"` - an unusable AF_UNIX temp dir makes the bind fail,
+so the JDK takes the TCP loopback path, which works. Full recipe in ERROR-017.
+
+### Verification
+- `:core:transfer:testDebugUnitTest` -> BUILD SUCCESSFUL, 70 tests, 0 failures (previously hung forever).
+- `MultiStreamDispatcherTest` run 8x standalone under JUnitCore with real threads: 8/8 green, ~1.3 s each - the
+  channel-death / redistribution races are not flaky.
+- Full `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL, 411 actionable tasks, 644 tests / 0 failures / 0 skipped
+  (app 1, core:common 42, core:discovery 79, core:engine 1, core:messaging 12, core:network 99, core:persistence 34,
+  core:security 80, core:transfer 70, ui:chat 189, ui:theme 37).
+
+### Next AI
+Device run is the only thing left for this batch: two phones, 10 MB over 5 GHz, exercise Pause/Resume/Cancel from BOTH
+sides and confirm the counterpart reacts (FLASH_XFER), then record EXP-002 against the EXP-001 hotspot baseline. Export
+`JAVA_TOOL_OPTIONS` as above in any shell that runs Gradle.
+
+## 2026-08-24 — Real N-socket multistream + speed-meter fix + pause diagnostics
+
+### Worked on
+Implemented dedicated TCP data channels (true parallel streams), fixed the field-reported runaway speed display, and instrumented pause paths.
+
+### Changed
+- **`core/network/datachannel/` (NEW):** `DataChannelFraming` (4-byte LE length prefix, JOIN handshake lines), `DataChannelServer` (accepts `FLASH_JOIN <targetDeviceId> <channelId>`, validates against local id, replies FLASH_OK/REJECT, per-connection reader with reply-down-same-connection), `DataChannelClient` (connect+join, returns null on failure for graceful fallback). Frames carry ChunkFrame payloads at full density — no WS masking/opcode overhead.
+- **Dev Console holder:** data server binds wsPort+1..+20; stream factory now opens a REAL socket per channel to the intended peer (port probed once per peer, cached), falling back to WS-multiplexed mode when the peer is unreachable/old build. Inbound ACK routing via late-bound `transferRef`; shared chunk router serves both WS and data-channel inbound.
+- **Speed fix (`RollingRateMeter`):** old impl kept only the FIRST sample while the time window slid → Δbytes unbounded over ≤2 s Δt → speed climbed continuously toward totalBytes/window (field-reported). Rewritten as a pruned sliding sample window.
+- **Pause diagnostics:** `pauseTransfer` logs direction/state/jobPresent (Log wrapped in runCatching for JVM tests).
+
+### Verification
+- Full suite: `testDebugUnitTest assembleDebug` → BUILD SUCCESSFUL, all modules green.
+- Pending device run: expect `StreamChannel[n] real socket → host:port` logs, `data channel joined`, and materially higher throughput on 5 GHz; speed readout should be stable instead of ramping.
+
+### Next AI
+Device test both phones updated: 10MB over 5 GHz router → record EXP-002 (compare EXP-001 hotspot baseline). Sender-side pause still under diagnosis — capture TRANSFER logcat during a pause attempt if it remains broken.
+
+## 2026-08-24 — Dev Console tabbed redesign + pause/resume while receiving (backpressure)
+
+### Worked on
+Redesigned the Dev Console (owner reported smashed-together layout) and added receive-side pause support.
+
+### Changed
+- **FlashDevConsoleScreen rewritten:** header status card (health dot, peer count, port), 3 tabs (PEERS = sessions + discovered endpoints; TRANSFERS = progress bars + Pause/Resume/Cancel per row with TX/RX badges + speed/bytes; NET = mode selector + gateway probe), rolling 30-line log strip. Transfer controls call `pauseTransfer/resumeTransfer/cancelTransfer`.
+- **Receive-side pause:** new `RealFlashTransferRepository.incomingControl` events; `pauseTransfer` on a Receiving transfer pauses intake instead of cancelling a job. Holder gates binary intake via `MutableStateFlow` checked before pulling each frame (`WsSession.awaitBinaryFrame()` manual-receive loop): channel fills → WS read loop blocks → TCP backpressure throttles sender. Resume drains buffered chunks (idempotent re-writes impossible; already-verified chunks never rewritten).
+- Known trade-off documented: chat frames on the paused session stall until resume (single socket).
+
+### Verification
+- Full suite: `testDebugUnitTest assembleDebug` → BUILD SUCCESSFUL (one transient messaging test failure during an ERROR-008 E:-drive cache episode; green after daemon restart).
+
+### Next AI
+Device test: start 10MB → receiver taps ⏸ Pause in TRANSFERS tab → expect sender throughput to drop to ~0 within seconds and receiver state Paused; ▶ Resume → transfer completes verified=true. Then proceed to real N-socket multistream (roadmap in handoff.md) or Phase 8 frontend wiring.
+
+## 2026-08-24 — Device-test round 2: ack-drain premature-failure fix + receive-side transfer tracking
+
+### Worked on
+Diagnosed the reported "20% then Failed" device symptom from sender logcat; fixed sender terminal-resolution; added receive-side visibility.
+
+### Diagnosis
+Receiver actually received and verified the ENTIRE file (its ACK batches + COMPLETE arrived at the sender, but "late/unmatched"). The UI % is ACK-confirmed bytes; at one 32-chunk batch (~20%) ingested, all sender workers had already exited (fire-and-forget socket-buffer sends outrun disk-paced ACKs), and `maybeResolveFromState(forceCoverageResolve=true)` / `failIfAllChannelsDead` treated uncovered+zero-alive as **"all channels failed"** — a false failure. Receiving was never broken and was always-on as designed.
+
+### Changed
+- **MultiStreamDispatcher:** when all workers exit while coverage is incomplete, arm a bounded `ACK_DRAIN_GRACE_MS` (15 s) deadline instead of failing instantly; watcher resolves Completed when late ACKs/COMPLETE land, or fails with an explicit `ack drain timeout: N unconfirmed` only if they truly never arrive. Same treatment in `failIfAllChannelsDead`.
+- **Receive-side tracking:** new additive `FlashTransferRepository.onIncomingStarted/Progress/Completed/Failed` (no-op defaults); `RealFlashTransferRepository` implements them over `_activeTransfers` (direction=Receiving). Dev Console holder registers inbound sessions on FILE_START, recomputes verified bytes from the pipeline done-set per ACK batch, and completes on receiver COMPLETE. Inbound transfers now appear in the Dev Console Active Transfers list on BOTH phones.
+- `updateTransferState` made non-suspend (pure StateFlow update).
+
+### Verification
+- Full suite: `testDebugUnitTest assembleDebug` → BUILD SUCCESSFUL, all modules green.
+- Pending device run.
+
+### Next AI
+Device test: Test 10MB both directions — expect BOTH consoles to show the transfer (sender Sending / receiver Receiving), progress to ~100% confirmed, Completed verified=true. If failure recurs, capture `errorMessage` from the transfer card (now explicit: ack drain timeout N chunks).
+
+## 2026-08-24 — Layer-by-layer engine audit vs media-downloader (pause/resume correctness fixes)
+
+### Worked on
+Read `media-downloader-main` engine layers (DownloadManager, SegmentedDownloader/HLS, DownloadQueueWorker, DownloadEntity/Dao) and compared against Flash's transfer stack to weed out pre-test issues. Found and fixed three pause/resume correctness bugs.
+
+### Changed
+- **Cancellation no longer marks Failed** (`RealFlashTransferRepository.executeSend`): `CancellationException` is now caught separately and re-thrown — previously it fell into `catch (Exception)` and overwrote the authoritative Paused/Cancelled state set by pause/cancelTransfer (media-dl `handleCancellation` pattern).
+- **Stable wire fileId across resume:** new `FlashTransfer.wireFileId`; resume reuses it instead of minting a fresh UUID that the receiver would reject as SESSION_CONFLICT (receiver keys sessions on transferId+fileId).
+- **Chunk done-set persisted:** `MultiStreamDispatcher.confirmedIndexesSnapshot()` exposed; progress collector diffs confirmed indexes and writes `TransferChunkEntity(done=true)` rows via `TransferChunkDao.insertAll` — `doneChunks()` resume seeding actually works now (was dead code: zero call sites).
+
+### Findings logged for later phases (not yet fixed)
+- Process-death restore: `_activeTransfers` is memory-only; Room rows never read back; `TransferEntity` lacks fileName/sourceUri/peerId/wireFileId columns (media-dl solves via full Room state + `resetRunningToQueued()`).
+- No queue/concurrency limit/retry-with-backoff (media-dl: WorkManager worker + transient-error classification).
+- Receiver-side resume identity check absent (media-dl validates sidecar against `dest.length() == total`; AGENTS §18 requires source identity validation too).
+- Receive-side done-set persistence + MediaStore publish of received files.
+
+### Verification
+- Full suite: `testDebugUnitTest assembleDebug` → BUILD SUCCESSFUL, all modules green.
+
+### Next AI
+Device test: send 10MB → mid-transfer Pause → Resume; expect receiver dedup (idempotent re-sends) and Completed/verified=true, UI state stays Paused during pause. Then tackle process-death restore (add columns to TransferEntity + startup rehydration) before relying on cross-restart resume.
+
+## 2026-08-24 — WS Mesh Hardening: correct out-of-order assembly, reliable frame delivery, liveness, glare safety (ERROR-015)
+
+### Worked on
+Audited the ADR-016 WebSocket swap end-to-end and fixed the defect family that made received files corrupt/unusable and could stall transfers, plus several lifecycle/security races.
+
+### Changed
+- **ReceivePipeline (`:core:transfer/chunked`):** opt-in `sinkFactory` (per-transfer `ChunkSink` resolved at FILE_START) + `emitSessionStarted`/`ReceiveEvent.SessionStarted`. Defaults preserve legacy behavior for existing callers/tests.
+- **Dev Console receiver:** each transfer now writes to its own random-access file at exact chunk offsets via `FileRandomAccessSinkHandle` + `RandomAccessChunkSink` (`index * chunkSize`) under `FlashReceived/<transferId>/<safeName>` — fixes scrambled out-of-order assembly. Handles flushed/closed on COMPLETE; path components sanitized.
+- **WsSession:** inbound text/binary now flow through bounded Channels with blocking sends on the read loop → TCP backpressure; no more silent `DROP_OLDEST` chunk loss (which permanently stalled senders on unACKed chunks).
+- **WsConnection:** 15 s keepalive PINGs + 45 s read timeout close half-open connections (hotspot NAT idle death previously blocked forever).
+- **WsFlashNetwork:** early frames buffered per-connection and flushed at registration (no post-handshake drop window); connect-glare closes the replaced session with identity-safe map removal; HELLO protocol version enforced both directions; `stop()` closes pending-handshake sockets.
+- **Peer-targeted sends:** `StreamChannelFactory.open(channelId, peerDeviceId)` threaded through `MultiStreamDispatcher` — file streams route to the intended recipient instead of an arbitrary live session.
+- **Resume fix:** `FlashTransfer.sourceUri`; `resumeTransfer` re-reads the original URI (was passing the display name).
+- **RealFlashTransferRepository:** dispatcher stays routable until job teardown so in-flight ACKs are consumed; pause/cancel no longer deregister early.
+- **DiscoveryEngineHolder:** start/stop serialized behind Mutex (no duplicate NSD engine leak); per-session collector jobs cancelled when sessions leave; chat wire moved to colon-safe `FLASH_MSG`/`FLASH_RCPT` field encoding; Room DB persisted to `flash-dev.db`; content-source open failures throw loudly; `file:///dummy/test_payload.bin` is now an explicit deterministic generated test stream.
+
+### Verification
+- Full suite: `testDebugUnitTest assembleDebug` → BUILD SUCCESSFUL; **644 tests / 0 failures / 0 skipped** across all modules.
+- Pending: two-phone physical run of Test 10MB (router + hotspot), chat ping, and file-picker send.
+
+### Remaining
+- Device verification of ERROR-015 fixes (owner).
+- Whole-file digest re-check on receive (`recheckWholeFileDigest`) not yet wired to assembled files.
+- TLS/pairing still unwired on this path (tracked debt, AGENTS.md §19).
+- Phase 8 UI App Shell wiring per `docs/ui-page-plan.md`.
+
+### Next AI
+Owner device test first: sender/receiver logs should show "Receiver destination opened file=..." then "Receiver completed ... verified=true" and a correctly sized/assembled file in `FlashReceived/<transferId>/`. If green, proceed to Phase 8 UI wiring.
+
 ## 2026-08-24 -- Unified WebSocket Mesh Transport & Transfer Pipeline Wiring
 
 ### Worked on

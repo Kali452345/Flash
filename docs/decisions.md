@@ -1,5 +1,79 @@
 # Decisions
 
+## ADR-019 - Multi-stream sender workers: one merged select loop over bounded queues
+
+### Decision
+`MultiStreamDispatcher` worker coroutines consume their own feed channel and the shared redistribution queue in a
+SINGLE loop via `select { ownFeed.onReceiveCatching; shared.onReceiveCatching }`, instead of two sequential phases
+(drain own feed, then drain shared). Queues stay bounded (`FEED_BUFFER_FRAMES = 8`, `SHARED_BUFFER_FRAMES = 32`).
+Handing work back to `shared` is non-blocking (`trySend` + 5 ms poll) and gives up when the transfer resolved,
+`shared` closed, or every channel is dead. All exit bookkeeping (`ownFeedsOpen`, `aliveWorkers`) lives in `finally`
+behind idempotent release closures. Dead workers drain their own feed but never consume `shared`.
+
+### Context
+Bounding the queues (to cap memory on large files) deadlocked the dispatcher: with phase-separated consumers, a
+worker blocked in `shared.send()` stops draining its own feed, so the materializer blocks on that feed, so survivors
+never reach the phase that drains `shared`. Early `return` paths also skipped the `ownFeedsOpen`/`aliveWorkers`
+decrements, so `shared` never closed and the terminal-resolution check never armed (ERROR-016 - the unit suite hung
+forever; on device this would have stalled any transfer with a mid-flight channel death).
+
+### Alternatives considered
+- Revert to `Channel.UNLIMITED` (the pre-existing behavior): rejected - it only hides the deadlock and serializes an
+  entire file into memory when the wire is slower than the disk.
+- Keep phases but have dying workers drain their feed into `shared` before exiting: still deadlocks, since `shared`
+  can be full while its only consumers are the workers still stuck in phase 1.
+- Unbounded `shared` with bounded feeds: bounds the common case but leaves redistribution memory unbounded exactly
+  in the failure scenario where frames pile up.
+
+### Revisit when
+Retransmit of sent-but-unACKed chunks is added (a dead worker would then requeue by index rather than by frame), or
+profiling shows the 5 ms redistribution poll is material versus a dedicated redistribution consumer.
+
+## ADR-018 - Transfer control plane on the wire: FLASH_XFER text frames + cooperative dispatcher pause
+
+### Decision
+1. Pause/resume/cancel are peer-visible: `RealFlashTransferRepository` emits `outgoingControl` intents that the host
+   encodes as `FLASH_XFER` text frames (`FlashTextFraming.encodeFields` with `action` + `transferId`) on the peer's
+   session; the receiving side maps them back through `onRemoteTransferControl(transferId, action)` and applies them
+   to its own local transfer. `incomingControl` stays the LOCAL intake gate (receive-side backpressure).
+2. Sender pause is COOPERATIVE, not job cancellation: `MultiStreamDispatcher.setPaused()` flips a `@Volatile` flag
+   and `awaitUnpause()` (polled every `PAUSE_POLL_MS = 25`) is checked by the materializer per chunk and by each
+   worker per frame. A paused transfer keeps its dispatcher, sockets, plan, and ACK bookkeeping alive.
+
+### Context
+Pausing only throttled the local side: the counterpart kept streaming (or kept waiting) with no idea the transfer
+had been paused or cancelled, and cancelling a sender by cancelling its coroutine tore down channel state that
+resume then had to rebuild from scratch, losing in-flight ACK accounting.
+
+### Alternatives considered
+- Binary control opcodes on the chunk channel: rejected - control must survive a saturated/paused data path, and the
+  text channel is already the session's out-of-band lane (chat MSG/RCPT).
+- Job cancel + full re-plan on resume: rejected - resume then re-sends confirmed chunks and cannot preserve the
+  receiver-authoritative completion state.
+
+### Revisit when
+Control frames need acknowledgement/retry (currently fire-and-forget over a live session; a peer that reconnects
+mid-pause is re-synced by the next progress/ACK exchange rather than by a replayed control frame).
+
+## ADR-017 - Per-transfer random-access receive sinks + peer-routed stream channels (WS mesh hardening)
+
+### Decision
+1. `ReceivePipeline` accepts an optional `sinkFactory: (FileStart) -> ChunkSink` resolved once per accepted FILE_START; hosts bind each transferId to its own destination handle (`FileRandomAccessSinkHandle` via `RandomAccessChunkSink`, offset `index * chunkSize`). A new opt-in `ReceiveEvent.SessionStarted` surfaces session opens. Default behavior (single shared sequential sink, no event) is unchanged.
+2. Inbound WS frames are delivered through bounded channels with **blocking sends on the read-loop thread** (TCP backpressure) instead of lossy `DROP_OLDEST` SharedFlows — dropped CHUNKs are un-ACKable and permanently stall multi-stream dispatch.
+3. `StreamChannelFactory.open(channelId, peerDeviceId)` carries the intended recipient so every channel of a send routes to the correct peer; fallback to any live session only when peer is unknown.
+4. WsConnection keepalive = 15 s application PINGs + 45 s SO_TIMEOUT: any 45 s inbound-silence window (half-open NAT) closes the connection.
+
+### Context
+First physical two-phone run of the ADR-016 swap produced unusable received files: the Dev Console sink appended chunks in arrival order while ADR-015 arrival is out-of-order by design (ERROR-015). The existing C5.9 policy types already provided offset-correct handles — they simply were not wired. Simultaneously, SharedFlow frame drops and the missing keepalive could hang transfers and mask dead peers.
+
+### Alternatives considered
+- Extending `ChunkSink.write(index, data)` with transferId/chunkSize: rejected — breaks every existing sink/test for information the pipeline already scopes per-session via a factory.
+- Unbounded frame buffers: rejected — unbounded memory under sustained disk-behind-network load; backpressure belongs at TCP.
+- Retransmit/NACK for lost chunks: unnecessary once drops are impossible at delivery level (loss now equals connection death).
+
+### Revisit when
+Multi-peer concurrent transfers need per-peer fairness across shared WebSockets, or EXP benchmarks show single-socket multiplexing bottlenecks (then: real N-socket streams per session).
+
 ## ADR-016 - Unified WebSocket Mesh Transport over Router and Hotspot (WsFlashNetwork + WsSession)
 
 ### Decision

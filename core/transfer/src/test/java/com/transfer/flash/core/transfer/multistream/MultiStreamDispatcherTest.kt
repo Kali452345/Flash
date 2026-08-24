@@ -107,10 +107,11 @@ class MultiStreamDispatcherTest {
         private fun forward(bytes: ByteArray) {
             for (event in receiver.onFrame(id, bytes)) {
                 val feedback = when (event) {
+                    is RoutedReceiveEvent.SessionStarted -> null
                     is RoutedReceiveEvent.AckBatchReady -> event.frameBytes
                     is RoutedReceiveEvent.Completed -> event.frameBytes
                     is RoutedReceiveEvent.Rejected -> throw AssertionError("rejected: $event")
-                }
+                } ?: continue
                 assertTrue(dispatcherProvider().onInboundFrame(id, feedback))
             }
         }
@@ -217,7 +218,7 @@ class MultiStreamDispatcherTest {
             chunker = Chunker(),
             meta = meta,
             source = ChunkSource { payload.inputStream() },
-            factory = StreamChannelFactory { id -> channels.firstOrNull { it.id == id } },
+            factory = StreamChannelFactory { id, _ -> channels.firstOrNull { it.id == id } },
             streamCount = streamCount,
             requestedChunkSize = chunkSize,
             workerDispatcher = testDispatcher,
@@ -377,7 +378,7 @@ class MultiStreamDispatcherTest {
             chunker = Chunker(),
             meta = meta,
             source = ChunkSource { payload.inputStream() },
-            factory = StreamChannelFactory { null },
+            factory = StreamChannelFactory { _, _ -> null },
             streamCount = 1,
             requestedChunkSize = chunkSize,
             onCompleteFrame = { emitted.add(it) },
@@ -428,7 +429,7 @@ class MultiStreamDispatcherTest {
             chunker = Chunker(),
             meta = meta,
             source = ChunkSource { payload.inputStream() },
-            factory = StreamChannelFactory { id -> dummyChannels.firstOrNull { it.id == id } },
+            factory = StreamChannelFactory { id, _ -> dummyChannels.firstOrNull { it.id == id } },
             streamCount = 2,
             requestedChunkSize = chunkSize,
             doneIndexes = listOf(0),

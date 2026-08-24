@@ -1,5 +1,61 @@
 # Current Handoff
 
+## 2026-08-24 -- RESOLVED: :core:transfer suite hang (ERROR-016) + Gradle startup failure (ERROR-017)
+- **Hang fixed, bounded queues kept.** `MultiStreamDispatcher.runWorker` is now ONE loop that `select`s over its own
+  feed and the shared redistribution queue (was two sequential phases); exit bookkeeping (`ownFeedsOpen`,
+  `aliveWorkers`) moved into `finally` behind idempotent releases; redistribution is `trySend` + 5 ms poll instead of a
+  blocking `send`; materializer breaks once the transfer resolved; `maybeResolveFromState` fails fast when nothing ever
+  reached a wire. Root cause + the discarded alternatives: ERROR-016 (RESOLVED) and ADR-019.
+  The permitted revert-to-`Channel.UNLIMITED` fallback was NOT needed - feeds=8 / shared=32 stay bounded.
+- **The phase-split deadlock was device-fatal, not just a test artifact:** any mid-flight channel death on a large file
+  could pin a worker in `shared.send()`, block the materializer on that worker's feed, and stall the transfer forever.
+- **Gradle can run again (ERROR-017).** Every invocation, incl. `gradlew --version`, was dying with `Unable to
+  establish loopback connection`: JDK 19+ builds every `Selector` on an AF_UNIX socket pair on Windows, and on this
+  machine AF_UNIX connect always fails EINVAL (bind succeeds, so the JDK's TCP fallback never triggers). Fix: point the
+  AF_UNIX temp dir at a nonexistent path so the bind fails and the JDK falls back to TCP loopback -
+  `export JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=Z:\nope"` (covers launcher, daemon and workers).
+  **Use this in every shell that runs Gradle** - see the Build environment note at the bottom.
+- **Docs:** ADR-018 (FLASH_XFER wire control plane + cooperative pause) and ADR-019 (single-loop bounded-queue workers)
+  added to `docs/decisions.md`; both were referenced from code but previously unwritten.
+- Everything else from this session stands: real N-socket data channels, FLASH_XFER control both directions,
+  cooperative dispatcher pause, speed-meter fix, Dev Console redesign.
+- **Only remaining step for this batch: the two-phone device run** (10 MB over 5 GHz; Pause/Resume/Cancel from both
+  sides; then record EXP-002 vs the EXP-001 hotspot baseline).
+
+## 2026-08-24 -- Real multistream (N TCP sockets) + speed fix
+- **Real multi-stream implemented:** `core/network/datachannel/` — plain-TCP side channels (`FLASH_JOIN` handshake, length-prefixed frames) bound to the WS session; factory opens one real socket per stream to the target peer (port probe ws+1..+20, cached), WS fallback if peer has no data server. ACKs reply down the arriving connection.
+- **Speed display fixed:** RollingRateMeter rewritten (sliding sample window); old version inflated continuously because Δbytes used the first-ever sample while Δtime stayed ≤2 s.
+- **Sender pause under diagnosis:** pauseTransfer now logs direction/state/jobPresent — capture TRANSFER logcat from a failing pause attempt.
+- Test matrix: both phones must run THIS build for data channels to engage; older peer = silent WS fallback.
+
+## 2026-08-24 -- Dev Console redesign + pause-while-receiving
+- Dev Console is now tabbed (PEERS / TRANSFERS / NET) with a status card and log strip; transfer rows have progress bars + Pause/Resume/Cancel (TX and RX).
+- Receive-side pause implemented via TCP backpressure: repo emits `incomingControl` events; holder gates intake before pulling frames (`WsSession.awaitBinaryFrame()`); sender throttles automatically, resume drains buffer. Chat stalls during receive-pause (single socket) — accepted v1 trade-off.
+- Real N-socket multistream roadmap (next perf milestone): see `docs/decisions.md` ADR-017 revisit + EXP-001 baseline. No external code download needed — dispatcher/receiver already speak N channels; only the transport factory must open N real sockets with a session-join handshake.
+
+## 2026-08-24 -- Device round 2: ack-drain fix (false "Failed" at ~20%) + receiver now visible in Active Transfers
+- **Root cause of the 20%-then-Failed symptom:** sender workers exit as soon as all chunks leave the socket buffer; ACKs lag behind disk-paced receiver verification, so `maybeResolveFromState`/`failIfAllChannelsDead` misread uncovered+zero-alive as channel failure. Receiver was fine and always-on — it had verified the entire file.
+- **Fix:** bounded 15 s ack-drain grace after worker exit; late ACK_BATCH/COMPLETE now resolve Completed. True failure message is explicit: `ack drain timeout: N unconfirmed`.
+- **Receive-side UI:** inbound transfers register via new additive `onIncomingStarted/Progress/Completed/Failed` repo hooks — Dev Console Active Transfers shows Receiving rows on the receiver phone too.
+
+## 2026-08-24 -- Layer-by-layer audit vs media-downloader: pause/resume correctness fixes
+- Compared `media-downloader-main` engine layers against Flash's transfer stack; fixed three pre-test bugs:
+  1. Pause/cancel no longer reports Failed (`CancellationException` handled separately, re-thrown).
+  2. Resume keeps the same wire fileId (`FlashTransfer.wireFileId`) — fresh UUIDs were rejected by the receiver as SESSION_CONFLICT.
+  3. Sender chunk done-set now persists to Room (`TransferChunkDao` was dead code) so resume seeding works.
+- Remaining gaps (deliberately deferred, in priority order): process-death restore (TransferEntity needs fileName/sourceUri/peerId/wireFileId columns + startup rehydration), queue/concurrency/retry-backoff, receiver-side identity validation + receive done-set persistence, MediaStore publish of received files.
+
+## 2026-08-24 -- WS Mesh Hardening (ERROR-015): correct assembly, reliable delivery, liveness, glare safety
+- **Received files now assemble correctly:** per-transfer random-access sinks (`FileRandomAccessSinkHandle` + `RandomAccessChunkSink`) write chunks at `index * chunkSize` under `FlashReceived/<transferId>/<safeName>`. The previous append-order sink scrambled out-of-order multi-stream arrival.
+- **No more silent frame drops:** WsSession delivers inbound frames via bounded blocking channels → TCP backpressure; dropped-chunk transfer stalls are structurally impossible.
+- **Liveness:** 15 s WS pings + 45 s read timeout close half-open hotspot connections.
+- **Handshake/glare races fixed:** early-frame buffering, replaced-session close, identity-safe disconnects, HELLO version enforcement, pending-handshake sockets closed on stop, Mutex-serialized start/stop.
+- **Peer-targeted sends:** stream channels route to the intended recipient (`StreamChannelFactory.open(channelId, peerDeviceId)`).
+- **Resume fix:** `FlashTransfer.sourceUri`; resume re-reads original content URI.
+- **Chat framing:** colon-safe `FLASH_MSG`/`FLASH_RCPT` field encoding via FlashTextFraming.
+- **Dev Console:** persisted Room DB (`flash-dev.db`); loud failure on source-open errors; deterministic generated 10MB test payload.
+- **Verified:** `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL — 644 tests / 0 failures / 0 skipped.
+
 ## 2026-08-24 -- Unified WebSocket Mesh Transport & Transfer Pipeline Wiring
 - **Implemented WebSocket Mesh Transport:** Created `WsFlashNetwork` and `WsSession` implementing `FlashNetwork` and `FlashSession`.
 - **Full-Duplex Multi-Peer Channels:** Each peer pair maintains an active WebSocket capable of streaming UTF-8 text (`MessageWireFrame` for chat) and binary frames (`ChunkFrame` for files) simultaneously.
@@ -14,7 +70,9 @@
 `main`
 
 ## Last verified build
-Commit `9060445` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
+Working tree at 2026-08-24 (ERROR-016 fix) — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL, 411 actionable tasks,
+**644 tests / 0 failures / 0 skipped**. `:core:transfer:testDebugUnitTest` alone: 70 tests green (was hanging).
+Previous reference point: commit `9060445` (411 tasks, 0 failures).
 
 ## Current phase
 **Phase 7 (Engine Facade) Complete + Unified WebSocket Transport Deployed.**
@@ -89,9 +147,15 @@ Commit `9060445` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tas
 ERROR-013 rewrite attempt REVERTED after findings: structured-concurrency dispatcher fixed symptoms but exposed entangled completion semantics (first-wins terminal guard vs late authoritative frames — racing-ACK regression); dedicated test dispatchers disproved pool starvation; thread dumps show claim/read lock as blocker. Next session: build completion state machine pure-first (PairingSessionStateMachine pattern), then thin executor. Tests remain @Ignore green-skipped.
 
 ## Last test
-testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-23); **636 tests / 0 failures / 6 skipped** (v1 multistream + @Ignore family retained).
+testDebugUnitTest assembleDebug - BUILD SUCCESSFUL (2026-08-24); **644 tests / 0 failures / 0 skipped** across 11 test
+modules (app 1, core:common 42, core:discovery 79, core:engine 1, core:messaging 12, core:network 99,
+core:persistence 34, core:security 80, core:transfer 70, ui:chat 189, ui:theme 37).
+`MultiStreamDispatcherTest` additionally re-run 8x standalone (real threads) - 8/8 green, no flakiness.
 
 ## Known blockers
+- **Environment (ERROR-017, WORKAROUND MANDATORY)**: Gradle cannot start at all in this environment without
+  `JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=Z:\nope"` (AF_UNIX connect is blocked OS-side, so `Selector.open()`
+  fails -> "Unable to establish loopback connection"). Export it before any `gradlew` call.
 - **Environment (ERROR-008, MITIGATED)**: E: drive intermittently returns "The device is not ready" during Gradle cache writes. Recovery: `.\gradlew.bat --stop`, kill stuck java PIDs, rebuild with a fresh daemon. Real fix is hardware-side (move caches off the removable/hot-plug device or disable its power management).
 
 ## Deferred / pending integration (do not forget)
@@ -114,7 +178,7 @@ All items below are absorbed into those two documents:
 - **Engine-side**: auto-retry/backoff indicator (UI-044), key-changed warning state (UI-031).
 
 ## Recommended next task
-**Next: ERROR-013 proper fix per logs/errors.md plan — (a) pure CompletionStateMachine test-first, (b) dispatcher as thin executor over it, (c) un-ignore scenarios one by one. Alternative: proceed P5 part 2 (FlashTransferRepository single-stream) while multi-stream design settles. Owner device run: Dev Console tap-to-connect between two phones.**
+**Owner device run (two phones):** Dev Console → Connect → Test 10MB on Router AND Hotspot. Expected sender log: chunks sent + "consumed by sender dispatcher" ACKs; expected receiver log: `Receiver destination opened file=...` → `Receiver completed transferId=... verified=true`, and a 10,485,760-byte file at `FlashReceived/<transferId>/test_10mb.bin`. Then Ping Msg both ways and Choose File & Send. If green, proceed to Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
 
 ## 2026-08-22 - P3 NSD session note (agent handoff)
 - LAN MVP networking now has `nsd/NsdTransport.kt` (:core:discovery) implementing FlashRadioTransport C3.2-C3.4 (identity TXT advertise + self-filter, continuous browse w/ capped restarts, API>=34 ServiceInfoCallback vs <34 hardened NsdResolveQueue split, NetworkRequest-scoped discovery API 33+). `NsdFlashDiscovery` untouched (R4). NOT yet Gradle-verified (forbidden session) - run testDebugUnitTest first; tests: nsd/NsdTransportLogicTest.kt (pure-JVM, no coroutines-test dep in module).
@@ -139,10 +203,16 @@ Priority order; each item = install latest debug APK, exercise, report pass/fail
 
 ## Build environment note
 ```powershell
-$env:JAVA_HOME="E:\AndroidDev\AndroidStudio\android-studio\jbr"; $env:PATH="$env:JAVA_HOME\bin;$env:PATH"; $env:GRADLE_USER_HOME="E:\Flash\.gradle-user-home"; .\gradlew.bat testDebugUnitTest installDebug
+$env:JAVA_HOME="E:\AndroidDev\AndroidStudio\android-studio\jbr"; $env:PATH="$env:JAVA_HOME\bin;$env:PATH"; $env:GRADLE_USER_HOME="E:\Flash\.gradle-user-home"
+# REQUIRED on this machine (ERROR-017) - without it every Gradle invocation dies with
+# "Unable to establish loopback connection" because AF_UNIX connect is blocked OS-side:
+$env:JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=Z:\nope"
+.\gradlew.bat testDebugUnitTest installDebug
 # If "The device is not ready" appears (ERROR-008):
 .\gradlew.bat --stop; taskkill /PID <stuck java pid> /F; then rerun with a fresh daemon.
 ```
+Git Bash equivalent: `export JAVA_HOME=... GRADLE_USER_HOME=... JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=Z:\nope"`
+then `./gradlew.bat testDebugUnitTest assembleDebug --console=plain`.
 
 ## Files most relevant to next task
 - `logs/handoff.md` testing backlog above (owner runs; lead fixes / marks VERIFIED)
