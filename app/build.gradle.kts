@@ -44,6 +44,7 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:transfer"))
     implementation(project(":core:messaging"))
+    implementation(project(":core:engine"))
     implementation(project(":ui:theme"))
     implementation(project(":ui:chat"))
     implementation(platform(libs.androidx.compose.bom))

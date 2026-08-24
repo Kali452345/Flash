@@ -43,11 +43,11 @@
 `testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase 6 (Messaging Repository & Durable Outbox) COMPLETED (2026-08-24).**
-- `RealFlashChatRepository` implemented over Room DAOs (`MessageDao`, `ConversationDao`, `OutboxDao`, `ReceiptDao`, `DraftDao`, `RecentSearchDao`).
-- Durable outbox pattern (C6.1), idempotent UUID message ingestion (C6.2), delivery receipts (C6.3), and ephemeral typing state (C6.6) implemented and verified.
-- Full test suite: 100% GREEN (225 tasks, 0 failures across all modules).
-- Up next: **Phase 7 (`:core:engine`)** — `FlashEngine` facade binding all subsystems for UI consumption.
+**Phase 7 (Engine Facade & Subsystem Aggregation) COMPLETED (2026-08-24).**
+- `:core:engine` module created and integrated into settings and app.
+- `FlashEngine` and `DefaultFlashEngine` facade binding all 6 subsystems (`chats`, `transfers`, `discovery`, `network`, `trustStore`, `settings`).
+- Full project build & test suite: 100% GREEN (411 Gradle tasks, `assembleDebug` + `testDebugUnitTest` successful with 0 failures).
+- Up next: **Phase 8 / App Shell & Pages Integration** (wiring UI navigation tabs and pages in `docs/ui-page-plan.md` to `FlashEngine`).
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` â€” two-pane not yet consumed by screens (integration pending).
