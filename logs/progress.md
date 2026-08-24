@@ -1,5 +1,24 @@
 # Progress Log
 
+## 2026-08-24 -- Phase P7 (Engine Facade & Subsystem Aggregation)
+
+### Worked on
+Implemented Phase 7 (`:core:engine`): Created the unified `FlashEngine` facade module aggregating all core subsystems (`chats`, `transfers`, `discovery`, `network`, `trustStore`, `settings`).
+
+### Changed
+- **settings.gradle.kts:** Registered `:core:engine` module.
+- **core/engine/build.gradle.kts:** Created `:core:engine` library module with `api` dependencies on all core modules.
+- **FlashEngine.kt:** Defined `FlashEngine` domain interface and `DefaultFlashEngine` aggregator.
+- **app/build.gradle.kts:** Added `:core:engine` dependency to `:app`.
+- **DefaultFlashEngineTest.kt:** Added unit tests verifying subsystem delegation and state binding.
+
+### Verification
+- Ran `:core:engine:testDebugUnitTest`: 100% green.
+- Ran full project `assembleDebug` and `testDebugUnitTest`: BUILD SUCCESSFUL (411 Gradle tasks, 0 failures across all modules).
+
+### Remaining
+- Phase 8: Final UI App Shell wiring & device verification backlog.
+
 ## 2026-08-24 -- Phase P6 (Messaging Repository, Room Integration & Durable Outbox)
 
 ### Worked on
