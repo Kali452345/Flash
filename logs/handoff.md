@@ -1,20 +1,22 @@
 # Current Handoff
 
-## 2026-08-24 -- Dev Console Hardening & LAN Connection Stability Session Note
-- **Fixed connection drop on physical devices:** `LanSession` read loop no longer closes the session on `SocketTimeoutException`; raised post-handshake `socket.soTimeout` to 30s so the 10s heartbeat cycle keeps the connection active and healthy.
-- **Fixed outbox race condition:** `RealFlashChatRepository` now guards `drainOutboxOnce()` with `Mutex`, preventing duplicate frame dispatch.
-- **Verified Build & Tests:** `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL (411 tasks, 0 failures).
-- **Installed to Device:** Tested on physical phone via ADB.
+## 2026-08-24 -- Unified WebSocket Mesh Transport (WsFlashNetwork + WsSession)
+- **Implemented WebSocket Mesh Transport:** Created `WsFlashNetwork` and `WsSession` implementing `FlashNetwork` and `FlashSession`.
+- **Full-Duplex Multi-Peer Channels:** Each peer pair maintains an active WebSocket capable of streaming UTF-8 text (`MessageWireFrame` for chat) and binary frames (`ChunkFrame` for files) simultaneously.
+- **Symmetric Router & Hotspot Support:** Operates seamlessly via mDNS discovery on standard Wi-Fi routers and via gateway/probe on mobile hotspots.
+- **Wired to Engine & Receivers:** Outbound sends route through active WebSockets, inbound chat messages persist into Room, and inbound file chunks flow into `ReceivePipeline` with auto-save to `FlashReceived/`.
+- **Verified Build & Tests:** `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL across all 10 modules (411 tasks, 0 failures).
+- **Installed to Device:** Tested debug APK installed on physical phone via ADB.
 
 ## Current branch
 `main`
 
 ## Last verified build
-Commit `daa9b68` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
+Commit `814267e` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
 
 ## Current phase
-**Phase 7 (Engine Facade) Complete + Dev Console Hardened.**
-- Ready for device transfer testing and Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
+**Phase 7 (Engine Facade) Complete + Unified WebSocket Transport Deployed.**
+- Ready for multi-device testing on Router / Hotspot networks and Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
 - `:core:engine` module created and integrated into settings and app.
 - `FlashEngine` and `DefaultFlashEngine` facade binding all 6 subsystems (`chats`, `transfers`, `discovery`, `network`, `trustStore`, `settings`).
 - Full project build & test suite: 100% GREEN (411 Gradle tasks, `assembleDebug` + `testDebugUnitTest` successful with 0 failures).
