@@ -1,6 +1,7 @@
 package com.transfer.flash.debug
 
 import android.content.Context
+import android.util.Log
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.discovery.core.CompositeDiscovery
 import com.transfer.flash.core.discovery.core.FlashAdvertisedIdentity
@@ -39,6 +40,11 @@ import kotlinx.coroutines.launch
  */
 object DiscoveryEngineHolder {
 
+    private const val TAG_DISCOVERY = "DISCOVERY"
+    private const val TAG_TRANSFER = "TRANSFER"
+    private const val TAG_CHAT = "CHAT"
+    private const val TAG_WS = "WS"
+
     @Volatile
     private var composite: CompositeDiscovery? = null
 
@@ -76,6 +82,8 @@ object DiscoveryEngineHolder {
             protocolVersion = 2,
         )
 
+        Log.i(TAG_DISCOVERY, "Starting Flash discovery with deviceId=${identity.deviceId.value} friendlyName=${identity.friendlyName}")
+
         val transport = com.transfer.flash.core.discovery.nsd.NsdTransport(
             context = appContext,
             apiLevel = com.transfer.flash.core.discovery.nsd.BuildNsdApiLevel,
@@ -96,6 +104,8 @@ object DiscoveryEngineHolder {
         val serverPort = (netStartResult as? com.transfer.flash.core.common.result.FlashResult.Success)?.value ?: 0
         check(serverPort > 0) { "Network server failed to start: ${(netStartResult as? com.transfer.flash.core.common.result.FlashResult.Failure)?.error}" }
 
+        Log.i(TAG_WS, "WsFlashNetwork server listening on port=$serverPort")
+
         engine.setMode(FlashDiscoveryMode.STANDARD)
         val result = engine.startAll(serverPort, identity)
         check(result.isSuccess) {
@@ -114,10 +124,12 @@ object DiscoveryEngineHolder {
                     override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
                         val session = networkImpl.activeSessions.value.values.firstOrNull() as? WsSession
                         return if (session != null) {
-                            session.connection.sendBinary(frameBytes)
+                            val ok = session.connection.sendBinary(frameBytes)
+                            Log.d(TAG_TRANSFER, "StreamChannel[$channelId] sent ${frameBytes.size} bytes -> $ok")
+                            ok
                         } else {
-                            delay(10)
-                            true
+                            Log.w(TAG_TRANSFER, "StreamChannel[$channelId] no active WebSocket session available")
+                            false
                         }
                     }
                 }
@@ -154,8 +166,11 @@ object DiscoveryEngineHolder {
                             "ACK:${wireFrame.messageId}:${wireFrame.conversationId}:${wireFrame.memberId}:${wireFrame.deliveredAt}"
                         else -> "RAW:${wireFrame}"
                     }
-                    session.connection.sendText(frameText)
+                    val sent = session.connection.sendText(frameText)
+                    Log.i(TAG_CHAT, "Dispatched chat wireFrame to $targetDeviceId: $frameText (success=$sent)")
+                    sent
                 } else {
+                    Log.w(TAG_CHAT, "Failed to dispatch chat wireFrame: no active session for $targetDeviceId")
                     false
                 }
             },
@@ -172,16 +187,19 @@ object DiscoveryEngineHolder {
                     fos.write(chunkBytes)
                     fos.flush()
                 }
+                Log.d(TAG_TRANSFER, "Receiver sink wrote chunk $index (${chunkBytes.size} bytes)")
             },
         )
 
         // Observe active WebSocket sessions for incoming chat messages and binary file chunks
         appScope.launch {
             networkImpl.activeSessions.collect { sessions ->
+                Log.i(TAG_WS, "Active sessions updated: count=${sessions.size} peers=${sessions.keys.map { it.value }}")
                 sessions.values.forEach { session ->
                     if (session is WsSession) {
                         appScope.launch {
                             session.incomingText.collect { text ->
+                                Log.i(TAG_CHAT, "Received text frame: $text")
                                 if (text.startsWith("MSG:")) {
                                     val parts = text.split(":", limit = 7)
                                     if (parts.size >= 7) {
@@ -214,18 +232,31 @@ object DiscoveryEngineHolder {
 
                         appScope.launch {
                             session.incomingBinary.collect { binaryData ->
+                                Log.d(TAG_TRANSFER, "Received binary frame: ${binaryData.size} bytes")
+                                // 1. First route to active senders (ACKs or COMPLETE from receiver)
+                                val handledBySender = transferImpl.onInboundFrame(binaryData)
+                                if (handledBySender) {
+                                    Log.d(TAG_TRANSFER, "Inbound binary frame consumed by sender dispatcher")
+                                    return@collect
+                                }
+
+                                // 2. If not consumed by sender, route to receiver pipeline
                                 val events = receivePipeline.onFrame(binaryData)
                                 for (event in events) {
                                     when (event) {
                                         is ReceiveEvent.AckBatchReady -> {
+                                            Log.d(TAG_TRANSFER, "Receiver emitting ACK batch with ${event.frame.indexes.size} indexes")
                                             val ackBytes = ChunkFrame.serialize(event.frame)
                                             session.connection.sendBinary(ackBytes)
                                         }
                                         is ReceiveEvent.Completed -> {
+                                            Log.i(TAG_TRANSFER, "Receiver completed file transfer: transferId=${event.frame.transferId} verified=${event.frame.verified}")
                                             val completeBytes = ChunkFrame.serialize(event.frame)
                                             session.connection.sendBinary(completeBytes)
                                         }
-                                        else -> Unit
+                                        is ReceiveEvent.Rejected -> {
+                                            Log.w(TAG_TRANSFER, "Receiver rejected chunk frame: reason=${event.reason} transferId=${event.transferId}")
+                                        }
                                     }
                                 }
                             }

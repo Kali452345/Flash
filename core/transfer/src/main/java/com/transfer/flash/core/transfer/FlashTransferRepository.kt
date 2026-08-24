@@ -22,4 +22,6 @@ interface FlashTransferRepository {
     suspend fun pauseTransfer(transferId: FlashTransferId): FlashResult<Unit>
     suspend fun resumeTransfer(transferId: FlashTransferId): FlashResult<Unit>
     suspend fun cancelTransfer(transferId: FlashTransferId): FlashResult<Unit>
+
+    fun onInboundFrame(bytes: ByteArray): Boolean = false
 }

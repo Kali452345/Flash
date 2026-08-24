@@ -254,7 +254,17 @@ class RealFlashTransferRepository(
         return FlashResult.Success(Unit)
     }
 
-    private fun updateTransferState(transferId: String, transform: (FlashTransfer) -> FlashTransfer) {
+    override fun onInboundFrame(bytes: ByteArray): Boolean {
+        var handled = false
+        runningDispatchers.values.forEach { dispatcher ->
+            if (dispatcher.onInboundFrame(0, bytes)) {
+                handled = true
+            }
+        }
+        return handled
+    }
+
+    private suspend fun updateTransferState(transferId: String, transform: (FlashTransfer) -> FlashTransfer) {
         _activeTransfers.update { list ->
             list.map { if (it.id.value == transferId) transform(it) else it }
         }
