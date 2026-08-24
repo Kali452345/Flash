@@ -188,12 +188,18 @@ fun FlashDevConsoleScreen(
             val currentTransfers = DiscoveryEngineHolder.currentTransfers()
             val activeTransfers by (currentTransfers?.activeTransfers ?: transferFallback).collectAsState()
 
-            var targetEndpointForPick by remember { mutableStateOf<com.transfer.flash.core.discovery.FlashDiscoveredEndpoint?>(null) }
+            val sessionsFallback = remember {
+                kotlinx.coroutines.flow.MutableStateFlow(emptyMap<com.transfer.flash.core.common.model.FlashDeviceId, com.transfer.flash.core.network.FlashSession>())
+            }
+            val activeSessionsMap by (currentNetwork?.activeSessions ?: sessionsFallback).collectAsState()
+            val activeSessions = activeSessionsMap.values.toList()
+
+            var targetDeviceForPick by remember { mutableStateOf<com.transfer.flash.core.common.model.FlashDevice?>(null) }
             val filePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
                 contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
             ) { uri: android.net.Uri? ->
-                if (uri != null && targetEndpointForPick != null) {
-                    val ep = targetEndpointForPick!!
+                val targetDevice = targetDeviceForPick
+                if (uri != null && targetDevice != null) {
                     val repo = DiscoveryEngineHolder.currentTransfers() ?: return@rememberLauncherForActivityResult
                     scope.launch {
                         var fileName = "selected_file"
@@ -208,11 +214,6 @@ fun FlashDevConsoleScreen(
                                 }
                             }
                         }
-                        val targetDevice = com.transfer.flash.core.common.model.FlashDevice(
-                            id = ep.deviceId,
-                            friendlyName = ep.friendlyName,
-                            transportType = ep.transportType,
-                        )
                         val result = repo.sendFile(
                             targetDevice = targetDevice,
                             fileUri = uri.toString(),
@@ -235,7 +236,7 @@ fun FlashDevConsoleScreen(
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.padding(top = 10.dp),
                 )
-                LazyColumn(Modifier.fillMaxWidth().weight(0.4f).padding(top = 4.dp)) {
+                LazyColumn(Modifier.fillMaxWidth().weight(0.35f).padding(top = 4.dp)) {
                     items(activeTransfers, key = { it.id.value }) { transfer ->
                         val percent = if (transfer.bytesTotal > 0) {
                             (transfer.bytesDone * 100 / transfer.bytesTotal).toInt()
@@ -261,13 +262,90 @@ fun FlashDevConsoleScreen(
                 }
             }
 
-            FlashText(
-                "Endpoints (${endpoints.size}) — tap to connect / transfer",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(top = 8.dp),
-            )
-            LazyColumn(Modifier.weight(0.6f).padding(top = 4.dp)) {
-                items(endpoints, key = { it.deviceId.value }) { ep ->
+            LazyColumn(Modifier.weight(0.65f).padding(top = 4.dp)) {
+                if (activeSessions.isNotEmpty()) {
+                    item {
+                        FlashText(
+                            "Active Connected Peers (${activeSessions.size})",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(vertical = 6.dp),
+                        )
+                    }
+                    items(activeSessions, key = { "session-${it.peerDeviceId.value}" }) { session ->
+                        val peerDev = session.peer
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp)
+                                .background(
+                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                                    RoundedCornerShape(8.dp),
+                                )
+                                .padding(10.dp),
+                        ) {
+                            FlashText(peerDev.friendlyName, style = MaterialTheme.typography.titleSmall)
+                            FlashText(
+                                "${session.peerDeviceId.value.take(12)}… · ${session.transportType} · Connected",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray,
+                            )
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.padding(top = 8.dp),
+                            ) {
+                                DevButton("Ping Msg") {
+                                    val chatRepo = DiscoveryEngineHolder.currentChats() ?: return@DevButton
+                                    scope.launch {
+                                        chatRepo.openConversation(session.peerDeviceId.value)
+                                        chatRepo.sendText("Hello from Flash Dev Console! Live session ping: ${System.currentTimeMillis()}")
+                                        connectLog = "Sent ping message to ${peerDev.friendlyName}"
+                                    }
+                                }
+                                DevButton("Choose File & Send") {
+                                    targetDeviceForPick = peerDev
+                                    filePickerLauncher.launch(arrayOf("*/*"))
+                                }
+                                DevButton("Test 10MB") {
+                                    val transferRepo = DiscoveryEngineHolder.currentTransfers() ?: return@DevButton
+                                    scope.launch {
+                                        val result = transferRepo.sendFile(
+                                            targetDevice = peerDev,
+                                            fileUri = "file:///dummy/test_payload.bin",
+                                            displayName = "test_10mb.bin",
+                                            fileSize = 10 * 1024 * 1024L,
+                                        )
+                                        connectLog = when (result) {
+                                            is com.transfer.flash.core.common.result.FlashResult.Success ->
+                                                "10MB Multi-stream transfer started to ${peerDev.friendlyName}"
+                                            is com.transfer.flash.core.common.result.FlashResult.Failure ->
+                                                "Transfer failed: ${result.error}"
+                                        }
+                                    }
+                                }
+                                DevButton("Disconnect") {
+                                    session.disconnect("User disconnected via Dev Console")
+                                    connectLog = "Disconnected from ${peerDev.friendlyName}"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    FlashText(
+                        "Discovered Endpoints (${endpoints.size}) — mDNS",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+                    )
+                }
+
+                items(endpoints, key = { "ep-${it.deviceId.value}" }) { ep ->
+                    val targetDev = com.transfer.flash.core.common.model.FlashDevice(
+                        id = ep.deviceId,
+                        friendlyName = ep.friendlyName,
+                        transportType = ep.transportType,
+                    )
                     Column(
                         Modifier
                             .fillMaxWidth()
@@ -291,13 +369,7 @@ fun FlashDevConsoleScreen(
                             DevButton("Connect") {
                                 val net = DiscoveryEngineHolder.currentNetwork() ?: return@DevButton
                                 scope.launch {
-                                    val result = net.connect(
-                                        com.transfer.flash.core.common.model.FlashDevice(
-                                            id = ep.deviceId,
-                                            friendlyName = ep.friendlyName,
-                                            transportType = ep.transportType,
-                                        ),
-                                    )
+                                    val result = net.connect(targetDev)
                                     connectLog = when (result) {
                                         is com.transfer.flash.core.common.result.FlashResult.Success ->
                                             "Connected to ${ep.friendlyName}"
@@ -315,19 +387,14 @@ fun FlashDevConsoleScreen(
                                 }
                             }
                             DevButton("Choose File & Send") {
-                                targetEndpointForPick = ep
+                                targetDeviceForPick = targetDev
                                 filePickerLauncher.launch(arrayOf("*/*"))
                             }
                             DevButton("Test 10MB") {
                                 val transferRepo = DiscoveryEngineHolder.currentTransfers() ?: return@DevButton
                                 scope.launch {
-                                    val targetDevice = com.transfer.flash.core.common.model.FlashDevice(
-                                        id = ep.deviceId,
-                                        friendlyName = ep.friendlyName,
-                                        transportType = ep.transportType,
-                                    )
                                     val result = transferRepo.sendFile(
-                                        targetDevice = targetDevice,
+                                        targetDevice = targetDev,
                                         fileUri = "file:///dummy/test_payload.bin",
                                         displayName = "test_10mb.bin",
                                         fileSize = 10 * 1024 * 1024L,
