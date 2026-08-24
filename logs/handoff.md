@@ -43,7 +43,13 @@
 `testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**ERROR-013 RESOLVED (2026-08-24). Full test suite green: BUILD SUCCESSFUL, 0 failures. Three source files changed: MultiStreamDispatcher.kt (materializer pos fix), MultiStreamDispatcherTest.kt (resume ACK + Dispatchers.Default), PipelineEndToEndTest.kt (reuse firstReceiver). Ready for commit + P5 part 2.**
+**Phase 5 (Chunked & Multi-stream Transfer) Part 1 & Part 2 COMPLETED (2026-08-24).**
+- Transfer framing v2, chunking, verify-before-write, resume bit-vector, multi-stream dispatcher, and multi-stream receiver implemented and verified.
+- `DestinationPolicy`, `RandomAccessSinkHandle`, `RandomAccessChunkSink`, and `TransferManifest` implemented.
+- `RealFlashTransferRepository` implemented and tested against Room DAOs and `MultiStreamDispatcher`.
+- `FlashTransferForegroundService` (`dataSync`) created and declared in manifest.
+- Build & test suite: 100% GREEN (70 tests in :core:transfer, 0 failures across all modules).
+- Ready for next phase: UI Tab Shell / TransfersScreen integration (PART 2 of ui-page-plan.md) or physical device benchmark.
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` â€” two-pane not yet consumed by screens (integration pending).

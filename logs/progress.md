@@ -1,5 +1,26 @@
 # Progress Log
 
+## 2026-08-24 -- Phase P5 part 2 (Transfer Repository, Destination Policy & Foreground Service)
+
+### Worked on
+Implemented P5 part 2: `DestinationPolicy` with random-access chunk sinks for out-of-order writes, multi-file `TransferManifest`, `RealFlashTransferRepository` orchestrating transfers and Room persistence, and `FlashTransferForegroundService` for background transfers (`dataSync`).
+
+### Changed
+- **policy/DestinationPolicy.kt:** Created `DestinationPolicy`, `DestinationTarget`, `TransferAcceptance`, `RandomAccessSinkHandle`, and `FileRandomAccessSinkHandle` using `RandomAccessFile` to support sparse/out-of-order chunk writes directly to storage offsets.
+- **policy/RandomAccessChunkSink.kt:** Implemented `ChunkSink` bridge computing exact byte offsets `(index * chunkSize)`.
+- **manifest/TransferManifest.kt:** Defined multi-file transfer session models `TransferManifest` and `ManifestItem`.
+- **RealFlashTransferRepository.kt:** Implemented `FlashTransferRepository` managing `MultiStreamDispatcher`, updating Room `TransferDao`/`TransferChunkDao`, tracking active jobs, and exposing `activeTransfers: StateFlow<List<FlashTransfer>>`.
+- **service/FlashTransferForegroundService.kt:** Implemented Android `dataSync` Foreground Service with persistent status notifications. Registered service and permission in `AndroidManifest.xml`.
+- **Tests:** Added `DestinationPolicyTest.kt` (verifying out-of-order sparse writes and exact SHA-256 matching) and `RealFlashTransferRepositoryTest.kt` (verifying repository lifecycle and cancellation).
+
+### Verification
+- Ran `:core:transfer:testDebugUnitTest`: all tests passing (70 tests total, 100% green).
+- Full app and transfer build: `:app:compileDebugKotlin` and full test suite BUILD SUCCESSFUL (0 errors).
+
+### Remaining
+- EXP physical device multi-stream throughput benchmarking (1 vs 2 vs 4 streams).
+- Final UI integration of `TransfersScreen` (P3) against `FlashTransferRepository`.
+
 ## 2026-08-24 -- ERROR-013 resolved, full green test suite
 
 ### Worked on
