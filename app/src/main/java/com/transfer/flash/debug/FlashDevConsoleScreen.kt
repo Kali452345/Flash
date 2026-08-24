@@ -121,9 +121,24 @@ fun FlashDevConsoleScreen(
                         }.onFailure { logLine = "stop failed: ${it.message}" }
                     }
                 }
-                DevButton("BG service", enabled = started) {
-                    FlashBackgroundService.start(context)
-                    logLine = "foreground service started"
+                DevButton("Probe Gateway") {
+                    val net = DiscoveryEngineHolder.currentNetwork()
+                    if (net == null) {
+                        logLine = "Start network first"
+                        return@DevButton
+                    }
+                    scope.launch {
+                        // In Android Hotspot, the host is virtually always 192.168.43.1 on port 8080 or the advertised port
+                        logLine = "Probing hotspot gateway 192.168.43.1..."
+                        // Probe common ports or iterate through network endpoints
+                        val result = net.connectManual("192.168.43.1", 0)
+                        logLine = when (result) {
+                            is com.transfer.flash.core.common.result.FlashResult.Success ->
+                                "Connected directly to Hotspot Host!"
+                            is com.transfer.flash.core.common.result.FlashResult.Failure ->
+                                "Probe failed: ${result.error}"
+                        }
+                    }
                 }
             }
 
@@ -167,12 +182,91 @@ fun FlashDevConsoleScreen(
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
+            val transferFallback = remember {
+                kotlinx.coroutines.flow.MutableStateFlow(emptyList<com.transfer.flash.core.transfer.model.FlashTransfer>())
+            }
+            val currentTransfers = DiscoveryEngineHolder.currentTransfers()
+            val activeTransfers by (currentTransfers?.activeTransfers ?: transferFallback).collectAsState()
+
+            var targetEndpointForPick by remember { mutableStateOf<com.transfer.flash.core.discovery.FlashDiscoveredEndpoint?>(null) }
+            val filePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+            ) { uri: android.net.Uri? ->
+                if (uri != null && targetEndpointForPick != null) {
+                    val ep = targetEndpointForPick!!
+                    val repo = DiscoveryEngineHolder.currentTransfers() ?: return@rememberLauncherForActivityResult
+                    scope.launch {
+                        var fileName = "selected_file"
+                        var fileSize = 1024 * 1024L
+                        runCatching {
+                            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                                val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                                val sizeIdx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                                if (cursor.moveToFirst()) {
+                                    if (nameIdx != -1) fileName = cursor.getString(nameIdx)
+                                    if (sizeIdx != -1) fileSize = cursor.getLong(sizeIdx)
+                                }
+                            }
+                        }
+                        val targetDevice = com.transfer.flash.core.common.model.FlashDevice(
+                            id = ep.deviceId,
+                            friendlyName = ep.friendlyName,
+                            transportType = ep.transportType,
+                        )
+                        val result = repo.sendFile(
+                            targetDevice = targetDevice,
+                            fileUri = uri.toString(),
+                            displayName = fileName,
+                            fileSize = fileSize,
+                        )
+                        connectLog = when (result) {
+                            is com.transfer.flash.core.common.result.FlashResult.Success ->
+                                "Multi-stream transfer started: $fileName (${fileSize / 1024} KB)"
+                            is com.transfer.flash.core.common.result.FlashResult.Failure ->
+                                "Transfer failed: ${result.error}"
+                        }
+                    }
+                }
+            }
+
+            if (activeTransfers.isNotEmpty()) {
+                FlashText(
+                    "Active Transfers (${activeTransfers.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+                LazyColumn(Modifier.fillMaxWidth().weight(0.4f).padding(top = 4.dp)) {
+                    items(activeTransfers, key = { it.id.value }) { transfer ->
+                        val percent = if (transfer.bytesTotal > 0) {
+                            (transfer.bytesDone * 100 / transfer.bytesTotal).toInt()
+                        } else 0
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                                .padding(8.dp),
+                        ) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                FlashText(transfer.fileName, style = MaterialTheme.typography.titleSmall)
+                                FlashText("${percent}%", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                            }
+                            FlashText(
+                                "State: ${transfer.state} · ${transfer.bytesDone / 1024} / ${transfer.bytesTotal / 1024} KB · ${transfer.speedBytesPerSec / 1024} KB/s",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray,
+                            )
+                        }
+                    }
+                }
+            }
+
             FlashText(
-                "Endpoints (${endpoints.size}) — tap to connect",
+                "Endpoints (${endpoints.size}) — tap to connect / transfer",
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(top = 8.dp),
             )
-            LazyColumn(Modifier.weight(1f).padding(top = 4.dp)) {
+            LazyColumn(Modifier.weight(0.6f).padding(top = 4.dp)) {
                 items(endpoints, key = { it.deviceId.value }) { ep ->
                     Column(
                         Modifier
@@ -220,7 +314,11 @@ fun FlashDevConsoleScreen(
                                     connectLog = "Sent ping message to ${ep.friendlyName}"
                                 }
                             }
-                            DevButton("Test 1MB Transfer") {
+                            DevButton("Choose File & Send") {
+                                targetEndpointForPick = ep
+                                filePickerLauncher.launch(arrayOf("*/*"))
+                            }
+                            DevButton("Test 10MB") {
                                 val transferRepo = DiscoveryEngineHolder.currentTransfers() ?: return@DevButton
                                 scope.launch {
                                     val targetDevice = com.transfer.flash.core.common.model.FlashDevice(
@@ -231,12 +329,12 @@ fun FlashDevConsoleScreen(
                                     val result = transferRepo.sendFile(
                                         targetDevice = targetDevice,
                                         fileUri = "file:///dummy/test_payload.bin",
-                                        displayName = "test_1mb.bin",
-                                        fileSize = 1024 * 1024L,
+                                        displayName = "test_10mb.bin",
+                                        fileSize = 10 * 1024 * 1024L,
                                     )
                                     connectLog = when (result) {
                                         is com.transfer.flash.core.common.result.FlashResult.Success ->
-                                            "Transfer started (${result.value.value.take(8)})"
+                                            "10MB Multi-stream transfer started (${result.value.value.take(8)})"
                                         is com.transfer.flash.core.common.result.FlashResult.Failure ->
                                             "Transfer failed: ${result.error}"
                                     }
