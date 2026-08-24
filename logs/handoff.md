@@ -1,10 +1,12 @@
 # Current Handoff
 
-## 2026-08-24 -- Unified WebSocket Mesh Transport (WsFlashNetwork + WsSession)
+## 2026-08-24 -- Unified WebSocket Mesh Transport & Transfer Pipeline Wiring
 - **Implemented WebSocket Mesh Transport:** Created `WsFlashNetwork` and `WsSession` implementing `FlashNetwork` and `FlashSession`.
 - **Full-Duplex Multi-Peer Channels:** Each peer pair maintains an active WebSocket capable of streaming UTF-8 text (`MessageWireFrame` for chat) and binary frames (`ChunkFrame` for files) simultaneously.
 - **Symmetric Router & Hotspot Support:** Operates seamlessly via mDNS discovery on standard Wi-Fi routers and via gateway/probe on mobile hotspots.
 - **Wired to Engine & Receivers:** Outbound sends route through active WebSockets, inbound chat messages persist into Room, and inbound file chunks flow into `ReceivePipeline` with auto-save to `FlashReceived/`.
+- **Sender ACK Routing:** Inbound `ACK_BATCH` and `COMPLETE` frames route directly to active `MultiStreamDispatcher` instances via `RealFlashTransferRepository.onInboundFrame()`.
+- **Structured Diagnostic Logging:** Added tags `DISCOVERY`, `WS`, `TRANSFER`, `CHAT`, `DEV` for clear visibility in Android Studio and `adb logcat`.
 - **Verified Build & Tests:** `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL across all 10 modules (411 tasks, 0 failures).
 - **Installed to Device:** Tested debug APK installed on physical phone via ADB.
 
@@ -12,7 +14,7 @@
 `main`
 
 ## Last verified build
-Commit `814267e` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
+Commit `9060445` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
 
 ## Current phase
 **Phase 7 (Engine Facade) Complete + Unified WebSocket Transport Deployed.**

@@ -1,30 +1,31 @@
 # Progress Log
 
-## 2026-08-24 -- Unified WebSocket Mesh Transport (WsFlashNetwork & WsSession)
+## 2026-08-24 -- Unified WebSocket Mesh Transport & Transfer Pipeline Wiring
 
 ### Worked on
-Implemented unified full-duplex WebSocket mesh transport supporting simultaneous chat messaging and chunked binary file transfers over both standard Wi-Fi Routers and Mobile Hotspots.
+Implemented unified full-duplex WebSocket mesh transport (`WsFlashNetwork` & `WsSession`), resolved sender/receiver ACK routing in `RealFlashTransferRepository`, wired live chunk persistence to storage, and added structured logging across all system tags.
 
 ### Changed
 - **core/network/ws/WsSession.kt:**
   - Implemented `FlashSession` backed by `WsConnection`.
-  - Exposes `incomingText: SharedFlow<String>` and `incomingBinary: SharedFlow<ByteArray>`.
-  - Supports `sendText(text)` for chat/signaling and `send(message)` / `sendBinary(bytes)` for chunked files.
+  - Multiplexes UTF-8 text (chat) and binary frames (chunked files).
 - **core/network/ws/WsFlashNetwork.kt:**
-  - Implemented `FlashNetwork` and `EndpointMemory` backed by `WsTransferServer` and `WsTransferClient`.
-  - Handles bidirectional `FLASH_WS_HELLO` handshakes on connection open (inbound or outbound).
-  - Maintains `activeSessions: StateFlow<Map<FlashDeviceId, FlashSession>>` for all mesh peers.
-- **core/network/ws/WsFlashNetworkTest.kt:**
-  - Added JUnit tests verifying loopback server/client handshake, text exchange, binary chunk exchange, and graceful disconnects (100% green).
+  - Full-duplex WebSocket mesh implementation of `FlashNetwork` and `EndpointMemory`.
+  - Connects over mDNS discovery on Wi-Fi Routers or manual/gateway probe on Mobile Hotspots.
+- **core/transfer/RealFlashTransferRepository.kt:**
+  - Implemented `onInboundFrame(bytes)` to route inbound `ACK_BATCH` and `COMPLETE` frames directly into active `MultiStreamDispatcher` instances.
 - **app/src/main/java/com/transfer/flash/debug/DiscoveryEngineHolder.kt:**
-  - Wired `WsFlashNetwork` to `RealFlashChatRepository` (for incoming/outgoing instant messages) and `RealFlashTransferRepository` + `ReceivePipeline` (for incoming/outgoing chunked binary transfers with auto-saving to storage).
+  - Inbound binary frames are checked for sender ACKs first; non-ACK frames flow into `ReceivePipeline`, verifying SHA-256 and auto-saving chunks to `FlashReceived/`.
+  - Added structured logs under tags: `DISCOVERY`, `WS`, `TRANSFER`, `CHAT`, `DEV`.
+- **app/src/main/java/com/transfer/flash/debug/FlashDevConsoleScreen.kt:**
+  - Added structured diagnostic logging to all action buttons (`Connect`, `Ping Msg`, `Choose File & Send`, `Test 10MB`, `Disconnect`).
 
 ### Verification
-- Ran full project build & test suite: `assembleDebug` + `testDebugUnitTest` -> BUILD SUCCESSFUL (411 tasks, 0 failures).
-- Installed updated debug APK to connected device via `adb install -r`.
+- Ran full test suite across all 10 modules: `assembleDebug testDebugUnitTest` -> BUILD SUCCESSFUL (411 tasks, 0 failures).
+- Installed updated debug APK to connected Android device via ADB.
 
 ### Next AI
-Proceed with device verification on both Wi-Fi Router and Hotspot environments, or continue with Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
+Test multi-phone WebSocket transfers and chat messaging on both Router and Hotspot networks via Dev Console, then proceed with Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
 
 ## 2026-08-24 -- Dev Console Hardening & LAN Connection Stability
 
