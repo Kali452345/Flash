@@ -1,5 +1,31 @@
 # Progress Log
 
+## 2026-08-24 -- Unified WebSocket Mesh Transport (WsFlashNetwork & WsSession)
+
+### Worked on
+Implemented unified full-duplex WebSocket mesh transport supporting simultaneous chat messaging and chunked binary file transfers over both standard Wi-Fi Routers and Mobile Hotspots.
+
+### Changed
+- **core/network/ws/WsSession.kt:**
+  - Implemented `FlashSession` backed by `WsConnection`.
+  - Exposes `incomingText: SharedFlow<String>` and `incomingBinary: SharedFlow<ByteArray>`.
+  - Supports `sendText(text)` for chat/signaling and `send(message)` / `sendBinary(bytes)` for chunked files.
+- **core/network/ws/WsFlashNetwork.kt:**
+  - Implemented `FlashNetwork` and `EndpointMemory` backed by `WsTransferServer` and `WsTransferClient`.
+  - Handles bidirectional `FLASH_WS_HELLO` handshakes on connection open (inbound or outbound).
+  - Maintains `activeSessions: StateFlow<Map<FlashDeviceId, FlashSession>>` for all mesh peers.
+- **core/network/ws/WsFlashNetworkTest.kt:**
+  - Added JUnit tests verifying loopback server/client handshake, text exchange, binary chunk exchange, and graceful disconnects (100% green).
+- **app/src/main/java/com/transfer/flash/debug/DiscoveryEngineHolder.kt:**
+  - Wired `WsFlashNetwork` to `RealFlashChatRepository` (for incoming/outgoing instant messages) and `RealFlashTransferRepository` + `ReceivePipeline` (for incoming/outgoing chunked binary transfers with auto-saving to storage).
+
+### Verification
+- Ran full project build & test suite: `assembleDebug` + `testDebugUnitTest` -> BUILD SUCCESSFUL (411 tasks, 0 failures).
+- Installed updated debug APK to connected device via `adb install -r`.
+
+### Next AI
+Proceed with device verification on both Wi-Fi Router and Hotspot environments, or continue with Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
+
 ## 2026-08-24 -- Dev Console Hardening & LAN Connection Stability
 
 ### Worked on
