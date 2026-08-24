@@ -101,13 +101,13 @@ class MultiStreamDispatcher(
     // Terminal bookkeeping: tiny critical sections, never held across I/O.
     private val terminalLock = Any()
     private var terminalResult: MultiStreamResult? = null
-    private lateinit var terminalDeferred: CompletableDeferred<MultiStreamResult>
+    private var terminalDeferred: CompletableDeferred<MultiStreamResult>? = null
     private val deadIds = java.util.Collections.synchronizedList(mutableListOf<Int>())
 
     private val rateMeter = RollingRateMeter(nowMs, speedWindowMs)
     private val completeEmittedOnce = AtomicBoolean(false)
+    @Volatile private var completeFrameBytesHolder: ByteArray? = null
 
-    private fun dbg(msg: String) { try { java.io.File("E:/Flash/.gradle-user-home/msdbg.txt").appendText(msg + "\n") } catch (_: Exception) {} }
     private data class PreparedFrame(val index: Int, val frameBytes: ByteArray)
 
     // ---- public API ------------------------------------------------------------------------------
@@ -129,7 +129,6 @@ class MultiStreamDispatcher(
                 return@coroutineScope deferred.await()
             }
 
-            dbg("send start pending=" + pendingIndexes.size)
             val effectiveStreams = streamCount.coerceIn(1, pendingIndexes.size)
             aliveWorkers.set(effectiveStreams)
 
@@ -147,7 +146,6 @@ class MultiStreamDispatcher(
                 }
             }
 
-            dbg("materializer up")
             // Materializer: sole reader of the strictly-sequential ChunkStream; closes feeds done.
             launch(workerDispatcher) {
                 try {
@@ -157,7 +155,7 @@ class MultiStreamDispatcher(
                         for (index in pendingIndexes) {
                             val s = stream ?: chunker.openChunkStream(
                                 source, meta, plan, resolvedDigest,
-                            ).also { stream = it; pos = index }
+                            ).also { stream = it }
                             while (pos < index) {
                                 s.next() // defensive skip
                                 pos++
@@ -167,18 +165,15 @@ class MultiStreamDispatcher(
                             feeds[index % effectiveStreams].send(
                                 PreparedFrame(index, ChunkFrame.serialize(frame)),
                             )
-                            dbg("produced idx=" + index + " -> feed=" + (index % effectiveStreams))
                         }
                     } finally {
                         stream?.closeQuietly()
                     }
                 } catch (e: Exception) {
-                    dbg("materializer EX=" + e.javaClass.simpleName + ": " + e.message)
                     if (e !is kotlinx.coroutines.CancellationException) {
                         failWith(deferred, "source read failed: ${e.message}")
                     }
                 } finally {
-                    dbg("materializer closing feeds")
                     feeds.forEach { it.close() }
                 }
             }
@@ -190,30 +185,26 @@ class MultiStreamDispatcher(
                     factory.open(id)
                         ?: return@coroutineScope failWith(
                             deferred, "channel factory refused stream $id",
-                        ).also { aliveWorkers.decrementAndGet() }
+                        )
                 } catch (t: Throwable) {
                     return@coroutineScope failWith(
                         deferred, "channel open failed: ${t.message}",
-                    ).also { aliveWorkers.decrementAndGet() }
+                    )
                 }
                 val startOk = runCatching {
                     channel.sendFrame(ChunkFrame.serialize(chunker.fileStart(meta, plan, resolvedDigest)))
-                }.isSuccess
+                }.getOrDefault(false)
                 if (!startOk) {
                     synchronized(terminalLock) { deadIds.add(id) }
-                    aliveWorkers.decrementAndGet()
                 }
-                channel
+                Pair(channel, startOk)
             }
-            dbg("opened=" + channels.size)
-            val workers = channels.mapIndexed { idx, channel ->
+            val workers = channels.mapIndexed { idx, (channel, startOk) ->
                 launch(workerDispatcher) {
-                    runWorker(idx, feeds[idx], shared, ownFeedsOpen, deferred, effectiveStreams, channel)
+                    runWorker(idx, feeds[idx], shared, ownFeedsOpen, deferred, channel, startOk)
                 }
             }
-            dbg("workers joined")
             workers.joinAll()
-            dbg("post-join confirmed=" + confirmedCount.get())
 
             // Deterministic final resolution (watcher may have resolved already; first-wins).
             maybeResolveFromState(deferred, forceCoverageResolve = true)
@@ -244,31 +235,37 @@ class MultiStreamDispatcher(
     private fun ingestAckBatch(frame: ChunkFrame.AckBatch): Boolean {
         if (frame.transferId != meta.transferId || frame.fileId != meta.fileId) return false
         markRangeConfirmed(frame.indexes)
-        if (confirmedCount.get() >= plan.totalChunks && coverageReachedAtMs == null) {
-            coverageReachedAtMs = nowMs()
+        val covered = confirmedCount.get() >= plan.totalChunks
+        if (covered && completeGraceMs == 0L) {
+            emitCompleteFrameOnce(receiverVerifiedField ?: true)
         }
         publishProgress()
         // Coverage may have just completed (e.g., manually-fed sessions): resolve now.
-        maybeResolveFromState(terminalDeferred, forceCoverageResolve = false)
+        terminalDeferred?.let { maybeResolveFromState(it, forceCoverageResolve = false) }
         return true
     }
 
     private fun ingestComplete(frame: ChunkFrame.Complete): Boolean {
         if (frame.transferId != meta.transferId || frame.fileId != meta.fileId) return false
-        markRangeConfirmed((0 until plan.totalChunks).toList()) // receiver is authoritative
         receiverVerifiedField = frame.verified
-        coverageReachedAtMs = nowMs()
-        maybeResolveFromState(terminalDeferred, forceCoverageResolve = true)
+        markRangeConfirmed((0 until plan.totalChunks).toList()) // receiver is authoritative
+        emitCompleteFrameOnce(frame.verified)
         publishProgress()
+        terminalDeferred?.let { maybeResolveFromState(it, forceCoverageResolve = true) }
         return true
     }
 
     private fun markRangeConfirmed(indexes: List<Int>) {
-        indexes.forEach { idx ->
-            if (!confirmedVector.isReceived(idx)) {
-                confirmedVector.markReceived(idx)
-                confirmedBytes.addAndGet(chunkBytes(idx))
-                confirmedCount.incrementAndGet()
+        synchronized(terminalLock) {
+            indexes.forEach { idx ->
+                if (!confirmedVector.isReceived(idx)) {
+                    confirmedVector.markReceived(idx)
+                    confirmedBytes.addAndGet(chunkBytes(idx))
+                    confirmedCount.incrementAndGet()
+                }
+            }
+            if (confirmedCount.get() >= plan.totalChunks && coverageReachedAtMs == null) {
+                coverageReachedAtMs = nowMs()
             }
         }
         publishProgress()
@@ -302,17 +299,20 @@ class MultiStreamDispatcher(
     private fun resolvedCompleted(
         chunksSent: Int,
         verified: Boolean? = receiverVerifiedField,
-    ): MultiStreamResult.Completed = MultiStreamResult.Completed(
-        totalChunks = plan.totalChunks,
-        chunksSent = chunksSent,
-        chunksSkippedResume = plan.totalChunks - pendingIndexes.size,
-        bytesSent = bytesSentTotal.get(),
-        bytesSkippedResume = resumedBytes,
-        fileSha256Hex = resolvedDigest,
-        verified = verified,
-        deadChannelIds = synchronized(terminalLock) { deadIds.toList() },
-        completeFrameBytes = emitCompleteFrameOnce(verified ?: true),
-    )
+    ): MultiStreamResult.Completed {
+        emitCompleteFrameOnce(verified ?: true)
+        return MultiStreamResult.Completed(
+            totalChunks = plan.totalChunks,
+            chunksSent = chunksSent,
+            chunksSkippedResume = plan.totalChunks - pendingIndexes.size,
+            bytesSent = bytesSentTotal.get(),
+            bytesSkippedResume = resumedBytes,
+            fileSha256Hex = resolvedDigest,
+            verified = verified,
+            deadChannelIds = synchronized(terminalLock) { deadIds.toList() },
+            completeFrameBytes = completeFrameBytesHolder,
+        )
+    }
 
     private fun failedLocked(reason: String): MultiStreamResult.Failed =
         MultiStreamResult.Failed(
@@ -332,9 +332,11 @@ class MultiStreamDispatcher(
 
     private fun emitCompleteFrameOnce(verified: Boolean): ByteArray? =
         if (completeEmittedOnce.compareAndSet(false, true)) {
-            ChunkFrame.serialize(ChunkFrame.Complete(meta.transferId, meta.fileId, verified))
-                .also { onCompleteFrame?.invoke(it) }
-        } else null
+            val bytes = ChunkFrame.serialize(ChunkFrame.Complete(meta.transferId, meta.fileId, verified))
+            completeFrameBytesHolder = bytes
+            onCompleteFrame?.invoke(bytes)
+            bytes
+        } else completeFrameBytesHolder
 
     // ---- workers -----------------------------------------------------------------------------------
 
@@ -350,31 +352,50 @@ class MultiStreamDispatcher(
         shared: Channel<PreparedFrame>,
         ownFeedsOpen: AtomicInteger,
         deferred: CompletableDeferred<MultiStreamResult>,
-        effectiveStreams: Int,
         wire: StreamChannel,
+        startOk: Boolean,
     ) {
-        dbg("worker$id up")
+        var sent = 0
+        var failed = 0
         // Phase 1: assigned frames. A wire failure flips this worker to "dead": everything
         // left of its assignment (including the failed frame) redistributes into `shared`,
         // and it stops touching its broken wire entirely.
-        var dead = false
-        dbg("worker$id iterating own feed")
+        var dead = !startOk
+        if (dead) {
+            synchronized(terminalLock) {
+                if (!deadIds.contains(id)) deadIds.add(id)
+            }
+        }
         for (prepared in ownFeed) {
-            dbg("worker$id sending idx=" + prepared.index)
-            val ok = !dead && runCatching { wire.sendFrame(prepared.frameBytes) }.isSuccess
-            if (ok) {
+            val ok = if (!dead) {
                 chunksSentTotal.incrementAndGet()
                 bytesSentTotal.addAndGet(chunkBytes(prepared.index))
+                val success = runCatching { wire.sendFrame(prepared.frameBytes) }.getOrDefault(false)
+                if (!success) {
+                    chunksSentTotal.decrementAndGet()
+                    bytesSentTotal.addAndGet(-chunkBytes(prepared.index))
+                }
+                success
             } else {
+                false
+            }
+
+            if (ok) {
+                sent++
+            } else {
+                failed++
                 if (!dead) {
                     dead = true
-                    synchronized(terminalLock) { deadIds.add(id) }
+                    synchronized(terminalLock) {
+                        if (!deadIds.contains(id)) deadIds.add(id)
+                    }
                 }
                 shared.send(prepared)
             }
         }
-        dbg("worker$id phase1 done")
-        if (ownFeedsOpen.decrementAndGet() == 0) { dbg("closing shared"); shared.close() }
+        if (ownFeedsOpen.decrementAndGet() == 0) {
+            shared.close()
+        }
 
         if (dead) {
             aliveWorkers.decrementAndGet()
@@ -384,21 +405,32 @@ class MultiStreamDispatcher(
 
         // Phase 2: help survivors drain redistributed frames until the shared queue closes
         // (closed by whichever worker consumed the last own-feed slot).
-        for (prepared in shared) {
-            val ok = runCatching { wire.sendFrame(prepared.frameBytes) }.isSuccess
-            if (!ok) {
-                shared.send(prepared) // hand back; another survivor takes it
-                aliveWorkers.decrementAndGet()
-                failIfAllChannelsDead(deferred)
-                return
+        try {
+            for (prepared in shared) {
+                chunksSentTotal.incrementAndGet()
+                bytesSentTotal.addAndGet(chunkBytes(prepared.index))
+                val ok = runCatching { wire.sendFrame(prepared.frameBytes) }.getOrDefault(false)
+                if (!ok) {
+                    chunksSentTotal.decrementAndGet()
+                    bytesSentTotal.addAndGet(-chunkBytes(prepared.index))
+                    shared.send(prepared) // hand back; another survivor takes it
+                    aliveWorkers.decrementAndGet()
+                    failIfAllChannelsDead(deferred)
+                    return
+                }
             }
-            chunksSentTotal.incrementAndGet()
-            bytesSentTotal.addAndGet(chunkBytes(prepared.index))
+        } finally {
+            aliveWorkers.decrementAndGet()
         }
     }
+
     private fun failIfAllChannelsDead(deferred: CompletableDeferred<MultiStreamResult>) {
-        if (aliveWorkers.get() == 0 && !deferred.isCompleted) {
-            deferred.complete(failedLocked("all channels failed"))
+        val alive = aliveWorkers.get()
+        if (alive == 0 && !deferred.isCompleted) {
+            val covered = confirmedCount.get() >= plan.totalChunks
+            if (!covered) {
+                deferred.complete(failedLocked("all channels failed"))
+            }
         }
     }
 

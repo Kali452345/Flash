@@ -146,10 +146,9 @@ class PipelineEndToEndTest {
         assertEquals(killAfterChunks, resumedCompleted.chunksSkippedResume)
         assertEquals(plan.totalChunks - killAfterChunks, resumedCompleted.chunksSent)
 
-        val secondReceiver = ReceivePipeline(assembler)
         var completedFrame: ChunkFrame.Complete? = null
         while (wire2.isNotEmpty()) {
-            for (event in secondReceiver.onFrame(wire2.removeFirst())) {
+            for (event in firstReceiver.onFrame(wire2.removeFirst())) {
                 when (event) {
                     is ReceiveEvent.AckBatchReady ->
                         assertTrue(resumedSender.onFrame(ChunkFrame.serialize(event.frame)))

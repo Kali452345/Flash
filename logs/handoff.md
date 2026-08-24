@@ -43,7 +43,7 @@
 `testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**MID-TASK HANDOFF (2026-08-23, project moving to internal SSD): ERROR-013 root cause FOUND+FIXED in uncommitted working tree - v3 MultiStreamDispatcher rewrite was missing FILE_START session announcement; receive pipeline rejected all chunks as UNKNOWN_TRANSFER (single bug behind every zero-progress/all-dead/confirmed=0 symptom). Fix applied but UNTESTED + debug probes still present. NEXT SESSION: read NEXT_SESSION_PROMPT.md at project root for complete continuation plan (remove probes, test, commit, then P5 part 2). Green baseline: commit 5b0fff7, 636 tests / 0 failures / 6 skipped.**
+**ERROR-013 RESOLVED (2026-08-24). Full test suite green: BUILD SUCCESSFUL, 0 failures. Three source files changed: MultiStreamDispatcher.kt (materializer pos fix), MultiStreamDispatcherTest.kt (resume ACK + Dispatchers.Default), PipelineEndToEndTest.kt (reuse firstReceiver). Ready for commit + P5 part 2.**
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` â€” two-pane not yet consumed by screens (integration pending).
