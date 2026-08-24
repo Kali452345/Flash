@@ -3,25 +3,39 @@ package com.transfer.flash.debug
 import android.content.Context
 import com.transfer.flash.core.common.model.FlashDeviceId
 import com.transfer.flash.core.discovery.core.CompositeDiscovery
-import com.transfer.flash.core.discovery.core.DiscoveryModePolicy
 import com.transfer.flash.core.discovery.core.FlashAdvertisedIdentity
 import com.transfer.flash.core.discovery.core.FlashDiscoveryMode
-import com.transfer.flash.core.network.DefaultFlashNetwork
+import com.transfer.flash.core.messaging.FlashChatRepository
+import com.transfer.flash.core.messaging.RealFlashChatRepository
+import com.transfer.flash.core.messaging.protocol.MessageWireFrame
+import com.transfer.flash.core.network.FlashNetwork
 import com.transfer.flash.core.network.bridge.DiscoveryRouteBinder
+import com.transfer.flash.core.network.ws.WsFlashNetwork
+import com.transfer.flash.core.network.ws.WsSession
+import com.transfer.flash.core.transfer.FlashTransferRepository
+import com.transfer.flash.core.transfer.RealFlashTransferRepository
+import com.transfer.flash.core.transfer.chunked.ChunkFrame
+import com.transfer.flash.core.transfer.chunked.ReceiveEvent
+import com.transfer.flash.core.transfer.chunked.ReceivePipeline
+import com.transfer.flash.core.transfer.multistream.StreamChannel
 import com.transfer.flash.identity.AppIdentity
-import java.net.ServerSocket
+import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
- * Process-wide engine holder for the debug Dev Console and background service
- * (P3.5/D-M4 + E; extended in option 2 with the real network layer).
+ * Process-wide engine holder for the debug Dev Console and background service.
  *
- * Provisional wiring: the durable engine facade lands in C7 (`:core:engine`).
- *
- * Owns a throwaway [ServerSocket] on an ephemeral port so NSD advertises a
- * real, connectable endpoint. Also constructs [DefaultFlashNetwork] and binds
- * discovery endpoints into its route memory via [DiscoveryRouteBinder] so the
- * console can connect to discovered peers by deviceId.
+ * Utilizes [WsFlashNetwork] as the full-duplex WebSocket mesh network layer,
+ * wired to [RealFlashChatRepository] for instant messaging and [RealFlashTransferRepository]
+ * with [ReceivePipeline] for chunked binary file transfers.
  */
 object DiscoveryEngineHolder {
 
@@ -29,24 +43,25 @@ object DiscoveryEngineHolder {
     private var composite: CompositeDiscovery? = null
 
     @Volatile
-    private var network: DefaultFlashNetwork? = null
+    private var network: WsFlashNetwork? = null
 
     @Volatile
-    private var transferRepo: com.transfer.flash.core.transfer.FlashTransferRepository? = null
+    private var transferRepo: FlashTransferRepository? = null
 
     @Volatile
-    private var chatRepo: com.transfer.flash.core.messaging.FlashChatRepository? = null
+    private var chatRepo: FlashChatRepository? = null
 
-    private var serverSocket: ServerSocket? = null
-    private var binderJob: kotlinx.coroutines.Job? = null
+    private var binderJob: Job? = null
+
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     fun current(): CompositeDiscovery? = composite
 
-    fun currentNetwork(): DefaultFlashNetwork? = network
+    fun currentNetwork(): FlashNetwork? = network
 
-    fun currentTransfers(): com.transfer.flash.core.transfer.FlashTransferRepository? = transferRepo
+    fun currentTransfers(): FlashTransferRepository? = transferRepo
 
-    fun currentChats(): com.transfer.flash.core.messaging.FlashChatRepository? = chatRepo
+    fun currentChats(): FlashChatRepository? = chatRepo
 
     suspend fun ensureStarted(context: Context): CompositeDiscovery {
         composite?.let { return it }
@@ -69,17 +84,14 @@ object DiscoveryEngineHolder {
         )
         val engine = CompositeDiscovery(transports = listOf(transport))
 
-        val networkImpl = DefaultFlashNetwork(
+        val networkImpl = WsFlashNetwork(
             context = appContext,
             localDeviceId = identity.deviceId.value,
             localFriendlyName = identity.friendlyName,
-            reconnectPolicy = com.transfer.flash.core.network.resilience.ReconnectPolicy(
-                random01 = { kotlin.random.Random.nextDouble() },
-            ),
         )
         binderJob = DiscoveryRouteBinder.observe(appScope, engine.discoveredEndpoints, networkImpl)
 
-        // Start the network server FIRST on an ephemeral port, so we know the EXACT port to advertise
+        // Start WebSocket network server
         val netStartResult = networkImpl.start(0)
         val serverPort = (netStartResult as? com.transfer.flash.core.common.result.FlashResult.Success)?.value ?: 0
         check(serverPort > 0) { "Network server failed to start: ${(netStartResult as? com.transfer.flash.core.common.result.FlashResult.Failure)?.error}" }
@@ -95,14 +107,18 @@ object DiscoveryEngineHolder {
             com.transfer.flash.core.persistence.db.FlashDatabase::class.java,
         ).build()
 
-        val transferImpl = com.transfer.flash.core.transfer.RealFlashTransferRepository(
+        val transferImpl = RealFlashTransferRepository(
             streamChannelFactory = { channelId ->
-                object : com.transfer.flash.core.transfer.multistream.StreamChannel {
+                object : StreamChannel {
                     override val id: Int = channelId
                     override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
-                        // In real test transfer, simulate network latency of chunks or push through active session
-                        kotlinx.coroutines.delay(10)
-                        return true
+                        val session = networkImpl.activeSessions.value.values.firstOrNull() as? WsSession
+                        return if (session != null) {
+                            session.connection.sendBinary(frameBytes)
+                        } else {
+                            delay(10)
+                            true
+                        }
                     }
                 }
             },
@@ -119,7 +135,7 @@ object DiscoveryEngineHolder {
             transferChunkDao = db.transferChunkDao(),
         )
 
-        val chatImpl = com.transfer.flash.core.messaging.RealFlashChatRepository(
+        val chatImpl = RealFlashChatRepository(
             localDeviceId = identity.deviceId.value,
             localDisplayName = identity.friendlyName,
             conversationDao = db.conversationDao(),
@@ -128,7 +144,96 @@ object DiscoveryEngineHolder {
             receiptDao = db.receiptDao(),
             draftDao = db.draftDao(),
             recentSearchDao = db.recentSearchDao(),
+            transportSink = { targetDeviceId, wireFrame ->
+                val session = networkImpl.activeSessions.value[FlashDeviceId(targetDeviceId)] as? WsSession
+                if (session != null) {
+                    val frameText = when (wireFrame) {
+                        is MessageWireFrame.TextMessage ->
+                            "MSG:${wireFrame.localId}:${wireFrame.conversationId}:${wireFrame.senderId}:${wireFrame.senderName}:${wireFrame.sentAt}:${wireFrame.text}"
+                        is MessageWireFrame.DeliveryReceipt ->
+                            "ACK:${wireFrame.messageId}:${wireFrame.conversationId}:${wireFrame.memberId}:${wireFrame.deliveredAt}"
+                        else -> "RAW:${wireFrame}"
+                    }
+                    session.connection.sendText(frameText)
+                } else {
+                    false
+                }
+            },
         )
+
+        // Setup inbound file receiver pipeline
+        val receivedDir = File(appContext.getExternalFilesDir(null), "FlashReceived").apply { mkdirs() }
+        val openFileStreams = ConcurrentHashMap<String, FileOutputStream>()
+
+        val receivePipeline = ReceivePipeline(
+            sink = { index, chunkBytes ->
+                val activeFile = File(receivedDir, "received_payload.bin")
+                FileOutputStream(activeFile, true).use { fos ->
+                    fos.write(chunkBytes)
+                    fos.flush()
+                }
+            },
+        )
+
+        // Observe active WebSocket sessions for incoming chat messages and binary file chunks
+        appScope.launch {
+            networkImpl.activeSessions.collect { sessions ->
+                sessions.values.forEach { session ->
+                    if (session is WsSession) {
+                        appScope.launch {
+                            session.incomingText.collect { text ->
+                                if (text.startsWith("MSG:")) {
+                                    val parts = text.split(":", limit = 7)
+                                    if (parts.size >= 7) {
+                                        chatImpl.onInboundWireFrame(
+                                            MessageWireFrame.TextMessage(
+                                                localId = parts[1],
+                                                conversationId = parts[2],
+                                                senderId = parts[3],
+                                                senderName = parts[4],
+                                                sentAt = parts[5].toLongOrNull() ?: System.currentTimeMillis(),
+                                                text = parts[6],
+                                            ),
+                                        )
+                                    }
+                                } else if (text.startsWith("ACK:")) {
+                                    val parts = text.split(":", limit = 5)
+                                    if (parts.size >= 5) {
+                                        chatImpl.onInboundWireFrame(
+                                            MessageWireFrame.DeliveryReceipt(
+                                                messageId = parts[1],
+                                                conversationId = parts[2],
+                                                memberId = parts[3],
+                                                deliveredAt = parts[4].toLongOrNull() ?: System.currentTimeMillis(),
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        appScope.launch {
+                            session.incomingBinary.collect { binaryData ->
+                                val events = receivePipeline.onFrame(binaryData)
+                                for (event in events) {
+                                    when (event) {
+                                        is ReceiveEvent.AckBatchReady -> {
+                                            val ackBytes = ChunkFrame.serialize(event.frame)
+                                            session.connection.sendBinary(ackBytes)
+                                        }
+                                        is ReceiveEvent.Completed -> {
+                                            val completeBytes = ChunkFrame.serialize(event.frame)
+                                            session.connection.sendBinary(completeBytes)
+                                        }
+                                        else -> Unit
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         val shouldStopNetwork = synchronized(this) {
             if (composite == null) {
@@ -151,17 +256,10 @@ object DiscoveryEngineHolder {
         return composite!!
     }
 
-    private val appScope by lazy {
-        kotlinx.coroutines.CoroutineScope(
-            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default,
-        )
-    }
-
     /** Stops advertising/browsing, sessions, and releases the ephemeral port. Idempotent. */
     suspend fun stopAll() {
         val currentEngine: CompositeDiscovery?
-        val currentNetwork: DefaultFlashNetwork?
-        var socket: ServerSocket? = null
+        val currentNetwork: WsFlashNetwork?
         synchronized(this) {
             currentEngine = composite
             currentNetwork = network
@@ -169,13 +267,10 @@ object DiscoveryEngineHolder {
             network = null
             transferRepo = null
             chatRepo = null
-            socket = serverSocket
-            serverSocket = null
         }
         binderJob?.cancel()
         binderJob = null
         currentEngine?.stopAll()
         currentNetwork?.stop()
-        runCatching { socket?.close() }
     }
 }
