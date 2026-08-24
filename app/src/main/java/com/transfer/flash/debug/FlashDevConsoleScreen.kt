@@ -297,18 +297,21 @@ fun FlashDevConsoleScreen(
                                 DevButton("Ping Msg") {
                                     val chatRepo = DiscoveryEngineHolder.currentChats() ?: return@DevButton
                                     scope.launch {
+                                        android.util.Log.i("DEV", "Triggered Ping Msg to ${peerDev.friendlyName} (${session.peerDeviceId.value})")
                                         chatRepo.openConversation(session.peerDeviceId.value)
                                         chatRepo.sendText("Hello from Flash Dev Console! Live session ping: ${System.currentTimeMillis()}")
                                         connectLog = "Sent ping message to ${peerDev.friendlyName}"
                                     }
                                 }
                                 DevButton("Choose File & Send") {
+                                    android.util.Log.i("DEV", "Opening file picker for ${peerDev.friendlyName}")
                                     targetDeviceForPick = peerDev
                                     filePickerLauncher.launch(arrayOf("*/*"))
                                 }
                                 DevButton("Test 10MB") {
                                     val transferRepo = DiscoveryEngineHolder.currentTransfers() ?: return@DevButton
                                     scope.launch {
+                                        android.util.Log.i("DEV", "Starting 10MB test transfer to ${peerDev.friendlyName}")
                                         val result = transferRepo.sendFile(
                                             targetDevice = peerDev,
                                             fileUri = "file:///dummy/test_payload.bin",
@@ -321,9 +324,11 @@ fun FlashDevConsoleScreen(
                                             is com.transfer.flash.core.common.result.FlashResult.Failure ->
                                                 "Transfer failed: ${result.error}"
                                         }
+                                        android.util.Log.i("DEV", "SendFile result: $connectLog")
                                     }
                                 }
                                 DevButton("Disconnect") {
+                                    android.util.Log.i("DEV", "Disconnecting session with ${peerDev.friendlyName}")
                                     session.disconnect("User disconnected via Dev Console")
                                     connectLog = "Disconnected from ${peerDev.friendlyName}"
                                 }
