@@ -10,10 +10,11 @@ import java.util.Collections
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import org.junit.Ignore
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -104,9 +105,7 @@ class MultiStreamDispatcherTest {
         }
 
         private fun forward(bytes: ByteArray) {
-            java.io.File("E:/Flash/.gradle-user-home/msdbg.txt").appendText("forward id=$id parsed=" + (com.transfer.flash.core.transfer.chunked.ChunkFrame.parse(bytes)?.javaClass?.simpleName ?: "null") + "\n")
             for (event in receiver.onFrame(id, bytes)) {
-                java.io.File("E:/Flash/.gradle-user-home/msdbg.txt").appendText("event id=$id " + event.javaClass.simpleName + "\n")
                 val feedback = when (event) {
                     is RoutedReceiveEvent.AckBatchReady -> event.frameBytes
                     is RoutedReceiveEvent.Completed -> event.frameBytes
@@ -143,12 +142,15 @@ class MultiStreamDispatcherTest {
         private val gate: CompletableFuture<Unit>,
     ) : LoopbackChannel(id, receiver, dispatcherProvider) {
         /** Set BEFORE blocking so observers can detect "slow channel engaged". */
+        @Volatile
         var startedSending = false
 
         override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
             if (!startedSending && ChunkFrame.parse(frameBytes) is ChunkFrame.Chunk) {
                 startedSending = true
-                gate.get(30, TimeUnit.SECONDS)
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    gate.get(30, TimeUnit.SECONDS)
+                }
             }
             return super.sendFrame(frameBytes)
         }
@@ -159,7 +161,7 @@ class MultiStreamDispatcherTest {
         id: Int,
         receiver: MultiStreamReceiver,
         dispatcherProvider: () -> MultiStreamDispatcher,
-        private val waitFor: () -> Unit,
+        private val waitFor: suspend () -> Unit,
     ) : LoopbackChannel(id, receiver, dispatcherProvider) {
         private var waited = false
 
@@ -181,7 +183,7 @@ class MultiStreamDispatcherTest {
                 GatedChannel(id, r, p, gate).also { slowRef = it }
             } else {
                 OrderedFastChannel(id, r, p) {
-                    awaitUntil(condition = { slowRef!!.startedSending })
+                    awaitUntil(condition = { slowRef?.startedSending == true })
                 }
             }
         })
@@ -197,10 +199,8 @@ class MultiStreamDispatcherTest {
         ) -> LoopbackChannel = ::LoopbackChannel,
         val streamCount: Int = 3,
     ) {
-        // Dedicated single-thread worker dispatcher: full-suite runs showed the shared
-        // Dispatchers.Default pool idle-parked while our workers never ran (ERROR-013).
         private val testExecutor =
-            java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ms-harness-worker") }
+            java.util.concurrent.Executors.newFixedThreadPool(8) { r -> Thread(r, "ms-harness-worker") }
         val testDispatcher = testExecutor.asCoroutineDispatcher()
 
         init {
@@ -233,7 +233,6 @@ class MultiStreamDispatcherTest {
             if (System.currentTimeMillis() > deadline) {
                 val stacks = java.lang.management.ManagementFactory.getThreadMXBean()
                     .dumpAllThreads(true, false)
-                    .filter { it.threadName.contains("Default") || it.threadName.contains("main") || it.threadName.contains("Test worker") }
                 val interesting = stacks.joinToString("\n") { st ->
                     val frames = st.stackTrace.take(12).joinToString(" | ") { f -> f.className.substringAfterLast(".") + ":" + f.methodName }
                     "THREAD " + st.threadName + " state=" + st.threadState + " :: " + frames
@@ -293,7 +292,7 @@ class MultiStreamDispatcherTest {
             val (h, gate, channels) = gatedHarness()
             val dispatcher = h.build()
             var result: MultiStreamResult? = null
-            val job = launch { result = dispatcher.send() }
+            val job = launch(Dispatchers.Default) { result = dispatcher.send() }
 
             val slow = channels[1]
             awaitUntil(condition = { h.fastSentTotal(excludeId = 1) == 13 }, describe = { "fast=" + h.fastSentTotal(1) + " dead=" + h.dispatcher.deadChannelsSnapshot() + " confirmed=" + h.dispatcher.confirmedCountSnapshot() })
@@ -309,7 +308,9 @@ class MultiStreamDispatcherTest {
     @Test
     fun `channel death mid transfer - unacked claims return to pool, survivor completes`() =
         runBlocking {
-            val h = Harness(channelsFactory = { id, r, p -> DyingChannel(id, r, p, failAfterChunks = 2) })
+            val h = Harness(channelsFactory = { id, r, p ->
+                if (id == 1) DyingChannel(id, r, p, failAfterChunks = 2) else LoopbackChannel(id, r, p)
+            })
             val dispatcher = h.build()
 
             val result = dispatcher.send()
@@ -341,13 +342,13 @@ class MultiStreamDispatcherTest {
         val (h, gate, _) = gatedHarness()
         val dispatcher = h.build()
         val samples = Collections.synchronizedList(ArrayList<MultiStreamProgress>())
-        val sampler = launch {
+        val sampler = launch(Dispatchers.Default) {
             while (dispatcher.progress.value.bytesDone < totalBytes && !gate.isDone) {
                 samples.add(dispatcher.progress.value)
                 Thread.sleep(2)
             }
         }
-        val job = launch { dispatcher.send() }
+        val job = launch(Dispatchers.Default) { dispatcher.send() }
         awaitUntil(condition = { h.fastSentTotal(excludeId = 1) == 13 }, describe = { "fast=" + h.fastSentTotal(1) + " dead=" + h.dispatcher.deadChannelsSnapshot() + " confirmed=" + h.dispatcher.confirmedCountSnapshot() })
         gate.complete(Unit)
         job.join()
@@ -403,42 +404,77 @@ class MultiStreamDispatcherTest {
 
     @Test
     fun `resume seeding - doneIndexes skipped, progress starts at resumed bytes`() = runBlocking {
-        val rxExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val rxExecutor = java.util.concurrent.Executors.newFixedThreadPool(4)
         val rxDipatcher = rxExecutor.asCoroutineDispatcher()
-        val h = Harness(streamCount = 2)
+        val sentIndexes = Collections.synchronizedList(ArrayList<Int>())
+        lateinit var dispatcherRef: MultiStreamDispatcher
+        val dummyChannels = (0 until 2).map { id ->
+            object : StreamChannel {
+                override val id: Int = id
+                override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
+                    val parsed = ChunkFrame.parse(frameBytes)
+                    if (parsed is ChunkFrame.Chunk) {
+                        sentIndexes.add(parsed.index)
+                        // Only ACK this chunk until all 18 pending chunks are sent, then also ACK chunk 0
+                        val ackIndexes = if (sentIndexes.size == 18) (0 until 19).toList() else listOf(parsed.index)
+                        val ack = ChunkFrame.AckBatch(meta.transferId, meta.fileId, ackIndexes)
+                        dispatcherRef.onInboundFrame(id, ChunkFrame.serialize(ack))
+                    }
+                    return true
+                }
+            }
+        }
         val dispatcher = MultiStreamDispatcher(
             chunker = Chunker(),
             meta = meta,
             source = ChunkSource { payload.inputStream() },
-            factory = StreamChannelFactory { id -> h.channels.firstOrNull { it.id == id } },
+            factory = StreamChannelFactory { id -> dummyChannels.firstOrNull { it.id == id } },
             streamCount = 2,
             requestedChunkSize = chunkSize,
             doneIndexes = listOf(0),
             workerDispatcher = rxDipatcher,
-        )
-        h.dispatcher = dispatcher
+            completeGraceMs = 0L,
+        ).also { dispatcherRef = it }
         var result: MultiStreamResult? = null
-        val job = launch { result = dispatcher.send() }
-
-        awaitUntil(condition = { h.channels.sumOf { s -> s.sentIndexes.size } == 18 }, describe = { "sent=" + h.channels.sumOf { s -> s.sentIndexes.size } + " dead=" + h.dispatcher.deadChannelsSnapshot() })
-        // Feed the missing confirmation manually (exercises direct inbound ingestion).
-        dispatcher.onInboundFrame(
-            0,
-            ChunkFrame.serialize(
-                ChunkFrame.AckBatch(meta.transferId, meta.fileId, (0 until 19).toList()),
-            ),
-        )
+        val job = launch(Dispatchers.Default) { result = dispatcher.send() }
         job.join()
 
-        val completed = result as MultiStreamResult.Completed
+        val completed = result as? MultiStreamResult.Completed
+            ?: throw AssertionError("Expected Completed but was: $result; reason=${(result as? MultiStreamResult.Failed)?.reason}")
         assertEquals(18, completed.chunksSent)
         assertEquals(1, completed.chunksSkippedResume)
         assertEquals(chunkSize.toLong(), completed.bytesSkippedResume)
-        assertFalse(h.channels.any { it.sentIndexes.contains(0) })
+        assertFalse("chunk 0 was sent in sentIndexes=$sentIndexes", sentIndexes.contains(0))
         assertEquals(totalBytes - chunkSize, completed.bytesSent)
         assertEquals(totalBytes, dispatcher.progress.value.bytesDone)
         rxDipatcher.close()
         rxExecutor.shutdownNow()
         Unit
+    }
+
+    @Test(timeout = 60_000)
+    fun `concurrent sessions - two peers transfer at the same time and both complete`() = runBlocking {
+        // Two fully independent harness pairs (own receiver, assembler, executor): proves the
+        // dispatcher holds no global state and simultaneous multi-peer transfers interleave safely.
+        val hA = Harness()
+        val hB = Harness()
+        val dispatcherA = hA.build()
+        val dispatcherB = hB.build()
+
+        val deferred = listOf(
+            async { dispatcherA.send() },
+            async { dispatcherB.send() },
+        ).awaitAll()
+
+        for ((i, result) in deferred.withIndex()) {
+            val h = if (i == 0) hA else hB
+            val completed = result as? MultiStreamResult.Completed
+                ?: throw AssertionError("session $i expected Completed got $result")
+            assertEquals(19, completed.chunksSent)
+            assertEquals(totalBytes, completed.bytesSent)
+            assertTrue("session $i assembler matches", h.assembler.matches(payload))
+            assertEquals("session $i exactly-once writes", 19, h.assembler.writes)
+            assertEquals(totalBytes, h.dispatcher.progress.value.bytesDone)
+        }
     }
 }

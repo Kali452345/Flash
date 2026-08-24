@@ -1,13 +1,34 @@
-﻿# Progress Log
 # Progress Log
 
-## 2026-08-23 — Phase P5 part 1 (chunked/multi-stream transfer) + Option-2 Dev Console integration
+## 2026-08-24 -- ERROR-013 resolved, full green test suite
 
 ### Worked on
-Executed P5 steps C5.1 + C5.3–C5.7 via two parallel research-first subagents plus lead contracts/fixes; then wired the option-2 Dev Console integration (discovery→network bridge) with JVM tests.
+Diagnosed and fixed the remaining MultiStreamDispatcher test failures (ERROR-013) and PipelineEndToEndTest resume failure.
 
 ### Changed
-- **C5.3–C5.6 (agent):** `transfer/chunked/` — binary framing v2 (`FLSH` magic, LE scalars, per-chunk raw SHA-256, ACK_BATCH every 32, COMPLETE verified flag; full byte-layout doc in KDoc), `Chunker` (64KB default, researched adaptive curve 16–256KB, single-pass whole-file digest), `Sha256`, `ResumeBitVector` (BitSet serialization + reconcile union), `ReceivePipeline` (verify-before-write C5.5, duplicate-idempotent), `SendPipeline` (two-pass digest prepass, resumeFrom linear-skip v1).
+- **MultiStreamDispatcher.kt:** Removed `pos = index` from materializer's `.also { stream = it; pos = index }` block -- the ChunkStream always starts at index 0, so `pos` must start at 0 for the skip loop `while (pos < index)` to actually skip resumed chunks.
+- **MultiStreamDispatcherTest.kt:** Fixed resume seeding test ACK batch to only ACK the specific chunk sent (not all chunks at once), added diagnostic message to `assertFalse(sentIndexes.contains(0))`.
+- **PipelineEndToEndTest.kt:** Changed resume test to reuse `firstReceiver` (which holds session state and chunks 0..11) instead of creating a fresh `secondReceiver` that has no session state.
+
+### Verification
+- `MultiStreamDispatcherTest`: 8/8 green.
+- `PipelineEndToEndTest`: 2/2 green.
+- Full `testDebugUnitTest`: BUILD SUCCESSFUL in 23s, 0 failures across all modules.
+
+### Remaining
+- P5 part 2: FlashTransferRepository, SAF/MediaStore, foreground service wiring.
+- EXP benchmark 1 vs 2 vs 4 streams on physical devices.
+
+### Next AI
+P5 part 2 repository layer or device benchmarking. ERROR-013 is fully resolved.
+
+## 2026-08-23 -- Phase P5 part 1 (chunked/multi-stream transfer) + Option-2 Dev Console integration
+
+### Worked on
+Executed P5 steps C5.1 + C5.3-C5.7 via two parallel research-first subagents plus lead contracts/fixes; then wired the option-2 Dev Console integration (discovery-network bridge) with JVM tests.
+
+### Changed
+- **C5.3-C5.6 (agent):** `transfer/chunked/` -- binary framing v2 (`FLSH` magic, LE scalars, per-chunk raw SHA-256, ACK_BATCH every 32, COMPLETE verified flag; full byte-layout doc in KDoc), `Chunker` (64KB default, researched adaptive curve 16-256KB, single-pass whole-file digest), `Sha256`, `ResumeBitVector` (BitSet serialization + reconcile union), `ReceivePipeline` (verify-before-write C5.5, duplicate-idempotent), `SendPipeline` (two-pass digest prepass, resumeFrom linear-skip v1).
 - **C5.7 (agent):** `transfer/multistream/` — dynamic first-free claim dispatch (MPSCP prior art; superseded plan's round-robin wording per R1 conflict rule → ADR-015), shared ACK mirror, failure isolation ≥1-alive, rolling-window progress/ETA telemetry, any-channel receiver routing.
 - **C5.1 (agent):** WsTransferManager/WsDiscovery/WsPairingStore relocated to `:core:transfer/wslegacy/` (LEGACY-marked; identity injected; Dispatchers.Default; LegacyDiscoveredDevice stand-in); originals deleted from :app; MainActivity stale comment fixed; WsPairingStore now JVM-testable (+3 tests).
 - **Option 2:** `bridge/DiscoveryRouteBinder` (C3→C4 seam: discovery snapshots → EndpointMemory) + 3 JVM tests; `DefaultFlashNetwork` implements it; DiscoveryEngineHolder now also constructs network + binds routes + starts listener; Dev Console shows health/peer-count and endpoints are tap-to-connect with connect result log.

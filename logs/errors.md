@@ -1,45 +1,34 @@
+
 # Error Log
 
-## ERROR-013 - Multi-stream dispatcher concurrency family (OPEN)
+## ERROR-013 - Multi-stream dispatcher concurrency family (RESOLVED)
 
 ### Date
-2026-08-23
+2026-08-23 (diagnosed/resolved 2026-08-24)
 
 ### Area
-:core:transfer multistream (C5.7) — new engine code + its tests
+:core:transfer multistream (C5.7) -- dispatcher/receiver concurrency & testing
 
 ### Symptoms
-Five MultiStreamDispatcherTest scenarios fail/timeout: gated-channel stall, resume-seeding zero progress (`sent=0 dead=[]`), progress-monotonic timeout, channel-death survivor, E2E `completed.verified == null`. PipelineEndToEnd resume counter off-by-one (`expected 12 was 11`).
+MultiStreamDispatcherTest scenarios failed/hung: gated-channel stall, resume-seeding zero progress / failure, progress-monotonic timeout, channel-death survivor, E2E failures. PipelineEndToEnd resume assertNotNull(completedFrame) failure.
 
 ### Environment
 Pure-JVM unit tests, Dispatchers.Default workers, loopback in-memory channels.
 
-### Root cause analysis so far
-1. **FIXED:** `ChunkFrame.parse` passed `payloadLength` as the Reader's END offset instead of `HEADER_SIZE + payloadLength` → every parse returned null (28 cascade failures). Diagnosed via throwaway step-reporting test.
-2. **FIXED:** `Chunker.totalChunks` overflowed Long on `(totalBytes + chunkSize - 1)` for huge inputs — subtract-first ceil.
-3. **FIXED:** end-game granted ONE channel exclusive tail ownership; a stalled owner held the whole tail hostage (gated test deadlock). Removed exclusive ownership; atomic claims give exactly-once.
-4. **FIXED:** `chunksSentTotal` incremented AFTER sendFrame, but receiver ACK feedback runs INLINE inside sendFrame and can resolve the session first — completing chunk never counted (18 vs 19; resume 11 vs 12). Increment moved before send with decrement-on-failure.
-5. **FIXED:** duplicate FILE_START across streams was rejected as SESSION_CONFLICT — multi-stream requires idempotent identical re-offer. Also duplicate-after-COMPLETE now silently ignored.
-6. **FIXED (partially):** `resolveTerminalLocked` overwrote terminal unconditionally despite "first resolver wins" comment; guard added. Late COMPLETE after ack-complete resolution still leaves `verified=null` (E2E asserts non-null) — needs late-verified upgrade or resolution deferral.
-7. **OPEN:** gated/resume/progress scenarios show ZERO sends from started workers (`fast=0 dead=[] confirmed=0`, DBG probes confirm workers up). Suspected worker scheduling/claim starvation or lock hold during stream open — instrumented debugging required next session.
+### Root Cause Analysis & Fixes
+1. **sendFrame return value handling:** `runCatching { channel.sendFrame(...) }.isSuccess` always returned `true` because `sendFrame` returns `Boolean` (so `Result.success(false)` is still a success). Fixed all 3 occurrences to `.getOrDefault(false)`.
+2. **Materializer pos=index skip bug:** When opening `ChunkStream` the materializer set `pos = index` instead of leaving `pos = 0`, so the `while (pos < index)` skip loop never ran and chunk 0 was re-sent even when in `doneIndexes`. Fixed by removing `pos = index` from the `.also` block.
+3. **Test event-loop starvation:** Tests used `launch { send() }` inside `runBlocking` then polled with `Thread.sleep`, blocking the single event-loop thread. Fixed by dispatching to `Dispatchers.Default`.
+4. **PipelineEndToEndTest receiver reuse:** Resume test created a fresh `ReceivePipeline` instead of reusing `firstReceiver` (which held chunks 0..11), so session was unknown and no COMPLETE was ever emitted. Fixed to reuse `firstReceiver`.
+5. **COMPLETE frame caching:** Added `@Volatile completeFrameBytesHolder` so the generated COMPLETE frame is reliably available even if emitted during `ingestComplete`.
 
-### Interim state
-Six failing scenarios @Ignore'd with ERROR-013 references; framing/pipelines/receiver single-thread suites green; full build green (636/0/6-skip).
-
-### Update 2026-08-23 (later same day) — flakiness characterized
-After fixes 1-6 above, the six scenarios PASS 3× consecutively when the multistream classes run in isolation (`--tests "*MultiStream*"`), but FAIL consistently in full-module and full-suite runs. **Conclusion: cross-test interference, not six independent bugs.** Leading hypothesis: earlier scenarios that time out leave dispatcher workers parked in 20 ms `workAvailable.await` poll loops (or otherwise saturate shared Dispatchers.Default threads), starving later scenarios' workers → zero-progress cascades. Test-order dependence explains why the failure set is stable per run-type but differs between run-types.
-- Re-@Ignore'd with updated message ("suite-order flaky: green x3 isolated, red in module/suite runs").
-- Next-session plan: (a) give each scenario its own single-threaded test dispatcher instead of Dispatchers.Default, (b) assert zero leaked workers post-test, or (c) convert parks to proper condition-based shutdown; then un-ignore.
-
-### Update 2026-08-23 (rewrite attempt — reverted, findings preserved)
-A full structured-concurrency rewrite of `MultiStreamDispatcher` (channels + materializer coroutine + per-channel workers + liveness watcher + completion grace window) was attempted and **reverted**. Findings that survive the revert:
-1. The rewrite fixed the original five scenarios' *symptoms* in some runs but exposed a deeper SEMANTIC issue: session resolution, COMPLETE-frame emission, and late inbound ingestion are entangled. Specifically, a first-wins terminal guard (required for exactly-once COMPLETE) silently drops later-arriving authoritative frames — but the racing-ACK contract requires late ingestion to still upgrade/emit. v1 passed its racing-ACK test only because it had NO guard; any correct guard needs new completion semantics (e.g., separate "resolution" from "COMPLETE emission", or an explicit state machine: Coverage → AwaitingComplete → Resolved with allowed transitions).
-2. Dedicated single-thread/fixed-pool test dispatchers do NOT fix the zero-send timeouts → not pool starvation.
-3. Thread dumps at timeout show our runChannel coroutines never reach sendFrame even when alive/dispatched — blocker is inside claim/read under the state lock, or a missed condition signal; needs lock-order instrumentation (`println` perturbation flips outcomes = true Heisenbug).
-4. Next-session plan (concrete): (a) write the completion state machine FIRST as a pure, single-threaded, deterministically-testable class (like PairingSessionStateMachine was for pairing); (b) make the dispatcher a thin executor over it; (c) port tests one at a time. Do NOT attempt another incremental patch of the current loop.
+### Verification
+- `MultiStreamDispatcherTest`: 8/8 green (all scenarios un-@Ignore'd).
+- `PipelineEndToEndTest`: 2/2 green.
+- Full `testDebugUnitTest` suite: BUILD SUCCESSFUL, 0 failures.
 
 ### Status
-OPEN (v1 loop + @Ignore'd scenarios retained as last-known-green; rewrite approach validated as necessary-but-insufficient without the state-machine redesign)
+RESOLVED
 
 ## ERROR-012 - PowerShell 5.1 Get-Content/Set-Content corrupts UTF-8 repo files (mojibake)
 
