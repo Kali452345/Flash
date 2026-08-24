@@ -182,8 +182,20 @@ fun FlashDevConsoleScreen(
                                 MaterialTheme.colorScheme.surfaceVariant,
                                 RoundedCornerShape(8.dp),
                             )
-                            .clickable {
-                                val net = DiscoveryEngineHolder.currentNetwork() ?: return@clickable
+                            .padding(10.dp),
+                    ) {
+                        FlashText(ep.friendlyName, style = MaterialTheme.typography.titleSmall)
+                        FlashText(
+                            "${ep.deviceId.value.take(12)}… · ${ep.hostAddress}:${ep.port} · ${ep.transportType}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray,
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(top = 8.dp),
+                        ) {
+                            DevButton("Connect") {
+                                val net = DiscoveryEngineHolder.currentNetwork() ?: return@DevButton
                                 scope.launch {
                                     val result = net.connect(
                                         com.transfer.flash.core.common.model.FlashDevice(
@@ -200,14 +212,37 @@ fun FlashDevConsoleScreen(
                                     }
                                 }
                             }
-                            .padding(10.dp),
-                    ) {
-                        FlashText(ep.friendlyName, style = MaterialTheme.typography.titleSmall)
-                        FlashText(
-                            "${ep.deviceId.value.take(12)}… · ${ep.hostAddress}:${ep.port} · ${ep.transportType}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray,
-                        )
+                            DevButton("Ping Msg") {
+                                val chatRepo = DiscoveryEngineHolder.currentChats() ?: return@DevButton
+                                scope.launch {
+                                    chatRepo.openConversation(ep.deviceId.value)
+                                    chatRepo.sendText("Hello from Flash Dev Console! Test ping: ${System.currentTimeMillis()}")
+                                    connectLog = "Sent ping message to ${ep.friendlyName}"
+                                }
+                            }
+                            DevButton("Test 1MB Transfer") {
+                                val transferRepo = DiscoveryEngineHolder.currentTransfers() ?: return@DevButton
+                                scope.launch {
+                                    val targetDevice = com.transfer.flash.core.common.model.FlashDevice(
+                                        id = ep.deviceId,
+                                        friendlyName = ep.friendlyName,
+                                        transportType = ep.transportType,
+                                    )
+                                    val result = transferRepo.sendFile(
+                                        targetDevice = targetDevice,
+                                        fileUri = "file:///dummy/test_payload.bin",
+                                        displayName = "test_1mb.bin",
+                                        fileSize = 1024 * 1024L,
+                                    )
+                                    connectLog = when (result) {
+                                        is com.transfer.flash.core.common.result.FlashResult.Success ->
+                                            "Transfer started (${result.value.value.take(8)})"
+                                        is com.transfer.flash.core.common.result.FlashResult.Failure ->
+                                            "Transfer failed: ${result.error}"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

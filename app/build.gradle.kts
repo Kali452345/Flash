@@ -39,6 +39,7 @@ android {
 
 dependencies {
     implementation(project(":core:common"))
+    implementation(project(":core:persistence"))
     implementation(project(":core:security"))
     implementation(project(":core:discovery"))
     implementation(project(":core:network"))
@@ -57,6 +58,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.6.1")
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
     testImplementation(libs.junit)
