@@ -41,6 +41,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Functional wire transport provider for sending frames to a target conversation / peer.
@@ -280,6 +282,8 @@ class RealFlashChatRepository(
         }
     }
 
+    private val drainMutex = Mutex()
+
     private suspend fun drainOutboxLoop() {
         while (true) {
             drainOutboxOnce()
@@ -288,24 +292,26 @@ class RealFlashChatRepository(
     }
 
     private suspend fun drainOutboxOnce() {
-        val now = System.currentTimeMillis()
-        val items = outboxDao.dueForDelivery(now, limit = 16)
-        for (item in items) {
-            outboxDao.incrementAttempts(item.localId)
-            val sink = transportSink
-            if (sink != null) {
-                val wireFrame = MessageWireFrame.TextMessage(
-                    localId = item.localId,
-                    conversationId = activeConversationId ?: "general",
-                    senderId = localDeviceId,
-                    senderName = localDisplayName,
-                    text = item.payloadJson,
-                    sentAt = now,
-                )
-                val success = sink.send(wireFrame.conversationId, wireFrame)
-                if (success) {
-                    outboxDao.delete(item.localId)
-                    messageDao.updateStatus(item.localId, "SENT")
+        drainMutex.withLock {
+            val now = System.currentTimeMillis()
+            val items = outboxDao.dueForDelivery(now, limit = 16)
+            for (item in items) {
+                outboxDao.incrementAttempts(item.localId)
+                val sink = transportSink
+                if (sink != null) {
+                    val wireFrame = MessageWireFrame.TextMessage(
+                        localId = item.localId,
+                        conversationId = activeConversationId ?: "general",
+                        senderId = localDeviceId,
+                        senderName = localDisplayName,
+                        text = item.payloadJson,
+                        sentAt = now,
+                    )
+                    val success = sink.send(wireFrame.conversationId, wireFrame)
+                    if (success) {
+                        outboxDao.delete(item.localId)
+                        messageDao.updateStatus(item.localId, "SENT")
+                    }
                 }
             }
         }

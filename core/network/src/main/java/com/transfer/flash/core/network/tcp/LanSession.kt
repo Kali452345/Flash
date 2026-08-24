@@ -244,10 +244,22 @@ class LanSession(
     }
 
     private suspend fun readLoop() = withContext(Dispatchers.IO) {
+        // Bump soTimeout to allow heartbeat-driven liveness (10s interval) to work.
+        // The probe/handshake path sets 4s which is too aggressive for idle sessions.
+        runCatching { socket.soTimeout = IDLE_READ_TIMEOUT_MS }
         var pendingDataFrameId: String? = null
         try {
             while (!closed.get() && scope.isActive) {
-                val line = reader.readLine() ?: break
+                val line = try {
+                    reader.readLine() ?: break
+                } catch (_: java.net.SocketTimeoutException) {
+                    // soTimeout fired — session is NOT dead. Liveness is owned by
+                    // HeartbeatTracker (DeclareDead closes the socket). Just loop.
+                    if (!closed.get()) {
+                        logger.log(LanSessionLogger.DEBUG, TAG, "LAN session read tick peerId=${peerInfo.deviceId}", null)
+                    }
+                    continue
+                }
 
                 val dataHeader = LanProbeMessages.parseData(line)
                 if (dataHeader != null) {
@@ -310,15 +322,6 @@ class LanSession(
 
                     else -> logger.log(LanSessionLogger.WARN, TAG, "LAN session ignored unknown message from peerId=${peerInfo.deviceId}", null)
                 }
-            }
-        } catch (timeout: java.net.SocketTimeoutException) {
-            // Probe/handshake leaves soTimeout (3-4 s) set on the socket.
-            // Legacy 3 s pings masked this by always keeping traffic flowing;
-            // with tracker-driven 10 s intervals an idle-but-healthy session
-            // legitimately exceeds it. Liveness is owned by HeartbeatTracker
-            // (DeclareDead closes the socket), so just re-arm the read.
-            if (!closed.get()) {
-                logger.log(LanSessionLogger.DEBUG, TAG, "LAN session read tick peerId=${peerInfo.deviceId}", null)
             }
         } catch (error: Exception) {
             if (!closed.get()) {
@@ -446,5 +449,14 @@ class LanSession(
         private const val FRAME_ACK_BUFFER = 64
         private const val HEARTBEAT_TICK_DIVISOR = 4L
         private const val MIN_HEARTBEAT_TICK_MS = 5L
+        /**
+         * Read timeout (ms) for the session after handshake. The probe sets
+         * soTimeout=4s for the handshake; once the session is established we
+         * raise it so the read loop survives idle intervals between heartbeat
+         * pings (default 10s). 30s ≈ 3× heartbeat interval — generous enough
+         * to tolerate Wi-Fi jitter while still unblocking the read periodically
+         * so the while-loop can check `closed`.
+         */
+        private const val IDLE_READ_TIMEOUT_MS = 30_000
     }
 }
