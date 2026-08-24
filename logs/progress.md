@@ -1,5 +1,28 @@
 # Progress Log
 
+## 2026-08-24 -- Dev Console Hardening & LAN Connection Stability
+
+### Worked on
+Fixed connection drop issues observed in physical device testing ("connected then goes connecting"), resolved outbox drain race condition, and verified multi-stream transfers via Dev Console.
+
+### Changed
+- **core/network/tcp/LanSession.kt:**
+  - Wrapped `reader.readLine()` inside the read loop `while` block so `SocketTimeoutException` continues the loop rather than falling through to `finally { close() }`.
+  - Added `IDLE_READ_TIMEOUT_MS = 30_000` (30s) post-handshake so heartbeat ticks (10s interval) operate reliably while allowing socket timeout checks.
+- **core/messaging/RealFlashChatRepository.kt:**
+  - Added `drainMutex = Mutex()` to synchronize `drainOutboxOnce()`, preventing duplicate wire frame dispatches when manual sends race with the background drain worker.
+- **app/src/main/java/com/transfer/flash/debug/FlashDevConsoleScreen.kt & DiscoveryEngineHolder.kt:**
+  - Added file picker (`OpenDocument`) with live multi-stream chunk progress and telemetry (speed, ETA, percentages).
+  - Port alignment fix: starting network server first to obtain dynamic port before advertising over NSD/mDNS.
+  - Auto-starting `FlashBackgroundService` (`connectedDevice` foreground service) to ensure connection listeners survive screen-off.
+
+### Verification
+- Full test suite: `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL in 27s (411 tasks, 0 failures).
+- Installed updated debug APK to connected device via `adb install -r`.
+
+### Next AI
+Proceed with physical device end-to-end testing between hotspot host and client devices, test direct file transfers via picker, or continue with Phase 8 UI App Shell wiring.
+
 ## 2026-08-24 -- Phase P7 (Engine Facade & Subsystem Aggregation)
 
 ### Worked on

@@ -1,49 +1,20 @@
 # Current Handoff
 
-## 2026-08-23 - P5 C5.1 session note (WsTransferManager/WsDiscovery/WsPairingStore relocated to :core:transfer/wslegacy)
-- Landed (NOT Gradle-verified): all three `:app` wstransfer classes moved to `core/transfer/src/main/java/com/transfer/flash/core/transfer/wslegacy/**` with LEGACY KDoc markers; `:app` wstransfer package DELETED; MainActivity stale comment fixed. Adaptations: identity constructor-injected (localDeviceId/localFriendlyName â€” C7 seam), scope dispatcher Main.immediateâ†Default (R2), WsPairingStore takes FlashTrustStore directly (Context moved to callsite; JVM test WsPairingStoreTest +3). New tiny LegacyDiscoveredDevice stands in for deleted :app DiscoveredDevice (unification TODO).
-- **LEAD ACTION REQUIRED before build:** add `implementation(project(":core:discovery"))` to core/transfer/build.gradle.kts (WsDiscovery needs NsdFlashDiscovery; dep verified absent, no transitive path). Everything else present.
-- **Nobody constructs WsTransferManager until C5.2/C7 wiring** â€” it auto-starts server+discovery in init.
-# Current Handoff
-
-## 2026-08-23 - P5 pure-logic agent session note (C5.7 MULTI-STREAM, :core:transfer/multistream)
-- Landed (NOT yet Gradle-verified): `multistream/StreamChannel.kt` (+StreamChannelFactory), `MultiStreamProgress.kt` (aggregate telemetry + RollingRateMeter, injected clock, 2s window), `MultiStreamDispatcher.kt` (dynamic claim loop over shared cursor + death-retry pool; end-game K=8 first-free single-owner tail w/ failover; ONE shared ResumeBitVector ACK mirror under one state lock, dedup = never re-count marked indexes; >=1 alive completes / all-dead Failed(unconfirmedIndexes); terminal COMPLETE emitted exactly once via CAS; claim+read atomic under lock, retry path reopens linear stream; injectable workerDispatcher+nowMs, no coroutines-test), `MultiStreamReceiver.kt` (any channel -> ONE ReceivePipeline; ACK_BATCH/COMPLETE routed down ARRIVING channel; exactly-once COMPLETE via serialized access).
-- Tests: multistream/MultiStreamDispatcherTest.kt (7) + MultiStreamReceiverTest.kt (3) - deterministic JVM (runBlocking + Dispatchers.Default + gates/polling). Created ONLY under core/transfer/src/{main,test}/.../multistream/**. wslegacy/** untouched. No gradle/toml changes. Gradle NOT run.
-- Decisions: ADR-015 (dynamic MPSCP-style claiming over static ranges; shared mirror; arrival-channel ACK routing; end-game tail). Research URLs in logs/progress.md entry of same date.
-- Deviations: StreamChannel is a normal interface (Kotlin fun-interface forbids `val id`); pause/cancel + stall timeouts deferred to engine layer; "round-robin per free stream" plan wording superseded by measured prior art per R1.
-- Next AI: run testDebugUnitTest (~10 new tests expected), fix fallout ONLY inside multistream/**, then EXP benchmark 1 vs 2 vs 4 streams on devices before fixing defaults.
-
-## 2026-08-23 - P5 pure-logic agent session note (C5.3-C5.6 chunked pipelines, :core:transfer/chunked)
-- Landed (NOT yet Gradle-verified): self-contained binary framing v2 `ChunkFrame` (FLSH|v2|type|len LE; parse returns null on ANY malformation), `Chunker` (64KB default, 16-256KB bounds, pure adaptiveSize() throughput curve, hashOnly prepass + lazy ChunkStream w/ per-chunk SHA-256 + whole-file digest identity guard), `Sha256` incremental/constant-time helpers (D3), `ResumeBitVector` (BitSet LE-word serialization, padding-safe, monotonic-union reconcile), `ReceivePipeline` (verify-before-write sink injection, ACK every 32 flushable, duplicate idempotent, graceful Rejected events incl. implicit-NACK hash mismatch), `SendPipeline` (suspend send():Boolean injection, resumeFrom(doneIndexes) linear-skip, confirmed/sent mirrors, Aborted{failedIndex,resumeCandidates}).
-- Tests: 7 new JUnit4 classes (~35 tests), deterministic JVM via runBlocking only (no coroutines-test dep). E2E: happy path + kill-after-k resume with byte-identical result.
-- Created ONLY files under core/transfer/src/{main,test}/java/com/transfer/flash/core/transfer/chunked/**. No gradle/toml/existing-file changes; Gradle NOT run.
-- Decisions: ADR-014 (framing v2 layout, raw 32B per-chunk hashes, union reconcile). Research URLs: logs/progress.md entry of same date + KDoc.
-# Current Handoff
-
-## 2026-08-23 - P4 part 2 stream B session note (LAN session hardening + delivery ACKs, C4.8/C4.3 in tcp/**)
-- Landed (NOT yet Gradle-verified): `LanSession` now emits real FrameAcks (`frameAcks: MutableSharedFlow` â€” SocketWritten per successful send, PeerAcknowledged on parsed `FLASH_ACK`), new `sendAwaitAck(message, timeoutMs=5000)` via additive `FLASH_DATA`/`FLASH_ACK` frames (protocol.md updated; existing frames byte-compatible), HeartbeatTracker-driven dead-peer detection (10 s Ã— 3 â‰ˆ 30 s, injectable constructor params, DeclareDead closes socket to unblock blocked readLine â€” JDK close() contract), read loop now tolerates probe leftover soTimeout. New injectable `LanSessionLogger` (JVM-test seam). Additive receive surface `incomingFrames: SharedFlow<String>`.
-- New test `tcp/LanSessionHardenedTest.kt`: +5 JVM loopback tests incl. two-real-session end-to-end acked send and duplicate-ACK dedup.
-- LanProbeServer/LanConnectionProbe UNTOUCHED (constructor stayed source-compatible). ws/**, tls/**, gradle untouched. Gradle NOT run.
-- Research citations: logs/progress.md entry 2026-08-23 (stream B).
-
-## 2026-08-23 - P4 part 2 stream A session note (TLS into WS transport, C4.1 completion)
-- Landed (NOT yet Gradle-verified): `tls/SecureSocketUpgrader.kt` (wrapClient eager+fail-closed / wrapAccepted lazy server mode / forceHandshake / withPlainStreamTracking taint guard enforcing the clean-boundary rule) + additive `TlsOptions?` on WsTransferServer & WsTransferClient â€” TLS wrap happens BEFORE the WS handshake bytes flow in both directions. Tests: tls/SecureSocketUpgraderTest + ws/SecureWsTransferLoopbackTest (~+7 expected).
-- Deviations: client context param now `Context?` (JVM-testable loopback); internal `WsLog` try/catch shim around android.util.Log (gradle untouchable this session); field name `expectedDeviceId`. tcp/** untouched; gradle untouched; Gradle NOT run.
-- Research citations: logs/progress.md entry 2026-08-23 (stream A).
-
-## 2026-08-23 - P3.5 A+B2/B3 session note (identity hardening + mode wiring)
-- Landed (NOT yet Gradle-verified â€” run `testDebugUnitTest` first): TXT `caps`/`fp8` keys (core TxtCodec + NsdTxtCodec mirror; encode delegates to core), `FlashAdvertisedIdentity.capabilities/fingerprintPrefix` (defaulted, backward compatible), pre-directory `proto != FlashProtocol.VERSION` drop in NsdTransport, `FlashRadioTransport.setMode(policy)` default-no-op seam, `NsdTransport.setMode` (GHOST suppresses/resumes advertise; ECO duty loop w/ conflated mid-idle wake; BOOST scales backoff base), `CompositeDiscovery.setMode` fan-out + `discoveryMode: StateFlow` + additive `[MODE] ` status prefix.
-- group/** and settings/** untouched (concurrent agent owns them). No gradle/toml changes. Research citations: logs/progress.md entry 2026-08-23. Design decisions: ADR-013.
-- New tests: TxtCodecTest +7, NsdTransportLogicTest +9, CompositeDiscoveryTest +4 (~+20 expected).
+## 2026-08-24 -- Dev Console Hardening & LAN Connection Stability Session Note
+- **Fixed connection drop on physical devices:** `LanSession` read loop no longer closes the session on `SocketTimeoutException`; raised post-handshake `socket.soTimeout` to 30s so the 10s heartbeat cycle keeps the connection active and healthy.
+- **Fixed outbox race condition:** `RealFlashChatRepository` now guards `drainOutboxOnce()` with `Mutex`, preventing duplicate frame dispatch.
+- **Verified Build & Tests:** `testDebugUnitTest assembleDebug` -> BUILD SUCCESSFUL (411 tasks, 0 failures).
+- **Installed to Device:** Tested on physical phone via ADB.
 
 ## Current branch
-`main` â€” remote: https://github.com/Kali452345/Flash.git (initial import commit `8a5c458`, 2026-08-22).
+`main`
 
 ## Last verified build
-`testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
+Commit `daa9b68` — `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks, 0 failures).
 
 ## Current phase
-**Phase 7 (Engine Facade & Subsystem Aggregation) COMPLETED (2026-08-24).**
+**Phase 7 (Engine Facade) Complete + Dev Console Hardened.**
+- Ready for device transfer testing and Phase 8 UI App Shell wiring (`docs/ui-page-plan.md`).
 - `:core:engine` module created and integrated into settings and app.
 - `FlashEngine` and `DefaultFlashEngine` facade binding all 6 subsystems (`chats`, `transfers`, `discovery`, `network`, `trustStore`, `settings`).
 - Full project build & test suite: 100% GREEN (411 Gradle tasks, `assembleDebug` + `testDebugUnitTest` successful with 0 failures).
