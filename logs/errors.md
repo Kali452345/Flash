@@ -1,6 +1,39 @@
 
 # Error Log
 
+## ERROR-014 - LanSession idle timeout kill & RealFlashChatRepository duplicate outbox drain (RESOLVED)
+
+### Date
+2026-08-24
+
+### Area
+:core:network (`LanSession`), :core:messaging (`RealFlashChatRepository`)
+
+### Symptoms
+1. Device session established ("connected"), but within 4 seconds closed immediately and reverted to "connecting". Logcat showed `LAN session read tick ...` followed immediately by peer disconnect.
+2. Unit tests in `:core:messaging` failed with `expected:<1> but was:<2>` in `RealFlashChatRepositoryTest.sendText writes message to Room and enqueues in outbox`.
+
+### Environment
+Android physical devices (LAN / Hotspot), JVM unit tests (`testDebugUnitTest`).
+
+### Root Cause
+1. `LanConnectionProbe` initializes the socket with `soTimeout = 4000` (4s) for the initial handshake. When `LanSession.readLoop()` started, it inherited this 4s timeout. In the previous implementation, when `SocketTimeoutException` was thrown after 4 seconds of idle time, the catch block was outside the `while` loop, exiting the loop and falling through to `finally { close() }`. The 10s heartbeat ping loop never got a chance to fire before the session was terminated.
+2. In `RealFlashChatRepository`, both the background `drainOutboxLoop()` and the manual call `drainOutboxOnce()` inside `sendText()` executed concurrently without a mutex. Under `testDispatcher` / concurrent execution, both routines read the un-deleted outbox items and dispatched duplicate `MessageWireFrame.TextMessage` instances.
+
+### Working Fix
+1. In `LanSession.kt`:
+   - Moved `try { reader.readLine() } catch (_: SocketTimeoutException)` **inside** the `while` loop so that a timeout merely continues the read loop rather than exiting and tearing down the session.
+   - Raised post-handshake `socket.soTimeout` to `IDLE_READ_TIMEOUT_MS = 30_000` (30s) to give the 10s heartbeat tracker ample headroom while retaining periodic unblocking.
+2. In `RealFlashChatRepository.kt`:
+   - Guarded `drainOutboxOnce()` with a `Mutex.withLock` to guarantee atomic outbox processing.
+
+### Verification
+- `testDebugUnitTest` across all modules: 411 tasks, 0 failures (100% green).
+- Deployed APK to physical device: LAN sessions remain stably connected.
+
+### Status
+RESOLVED
+
 ## ERROR-013 - Multi-stream dispatcher concurrency family (RESOLVED)
 
 ### Date
