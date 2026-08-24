@@ -68,6 +68,7 @@ class MultiStreamReceiver(
         synchronized(lock) { pipeline.activeTransferIds() }
 
     private fun ReceiveEvent.route(fromChannelId: Int): RoutedReceiveEvent = when (this) {
+        is ReceiveEvent.SessionStarted -> RoutedReceiveEvent.SessionStarted(frame, fromChannelId)
         is ReceiveEvent.AckBatchReady -> RoutedReceiveEvent.AckBatchReady(frame, fromChannelId)
         is ReceiveEvent.Completed -> RoutedReceiveEvent.Completed(frame, fromChannelId)
         is ReceiveEvent.Rejected ->
@@ -77,6 +78,12 @@ class MultiStreamReceiver(
 
 /** A [ReceiveEvent] tagged with the channel id it must be answered on. */
 sealed interface RoutedReceiveEvent {
+
+    /** Informational: a receive session opened (no wire reply required). */
+    data class SessionStarted(
+        val frame: ChunkFrame.FileStart,
+        val channelId: Int,
+    ) : RoutedReceiveEvent
 
     /** Serialize [frameBytes-serialized frame][frame] and send down [channelId]. */
     data class AckBatchReady(

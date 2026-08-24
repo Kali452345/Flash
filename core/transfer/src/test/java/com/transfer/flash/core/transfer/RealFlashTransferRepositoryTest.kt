@@ -59,7 +59,7 @@ class RealFlashTransferRepositoryTest {
 
         // Loopback factory for test
         var activeChannel: StreamChannel? = null
-        val factory = StreamChannelFactory { channelId ->
+        val factory = StreamChannelFactory { channelId, _ ->
             activeChannel ?: object : StreamChannel {
                 override val id: Int = channelId
                 override suspend fun sendFrame(frameBytes: ByteArray): Boolean {

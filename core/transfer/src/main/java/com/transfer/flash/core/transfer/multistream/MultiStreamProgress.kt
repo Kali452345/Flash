@@ -32,10 +32,11 @@ data class MultiStreamProgress(
  * Rolling-window byte-delta rate estimator shared by all streams of one session. Deterministic:
  * the clock is injected, so JVM tests drive it with a fake timeline.
  *
- * Rate semantics follow the cumulative-sample pattern (Δbytes / Δtime between the oldest sample
- * still inside the window and now — NOT a fixed-window denominator, which under-reports right
- * after start): see prior art in BucketCat's SpeedWindow and the unsloth transfer-stats sampler
- * (window span from oldest surviving sample; stability gating).
+ * Keeps (timestamp, cumulativeBytes) samples inside [windowMs] and reports
+ * `(newest.bytes - oldest.bytes) / (newest.t - oldest.t)` over that span. Earlier revision kept
+ * only the FIRST sample ever while letting the time window slide — Δbytes grew unbounded while
+ * Δtime stayed window-sized, so reported speed climbed continuously toward totalBytes/window
+ * regardless of actual throughput (field-reported on device, 2026-08-24).
  */
 internal class RollingRateMeter(
     private val nowMs: () -> Long,
@@ -45,38 +46,45 @@ internal class RollingRateMeter(
         require(windowMs > 0) { "windowMs must be > 0" }
     }
 
-    private var firstAt: Long = -1L
-    private var lastAt: Long = -1L
-    private var firstBytes: Long = 0L
-    private var lastBytes: Long = 0L
+    private class Sample(val atMs: Long, val cumulativeBytes: Long)
+
+    private val samples = ArrayDeque<Sample>()
 
     /** Records that cumulative progress reached [cumulativeBytes] at the injected "now". */
+    @Synchronized
     fun record(cumulativeBytes: Long) {
         val t = nowMs()
-        if (firstAt < 0L) {
-            firstAt = t
-            firstBytes = cumulativeBytes
-        } else if (t < lastAt) {
-            // Clock went backwards (host suspend/NTP): re-anchor instead of producing negatives.
-            firstAt = t
-            firstBytes = lastBytes
+        val last = samples.lastOrNull()
+        if (last != null && t < last.atMs) {
+            // Clock went backwards (host suspend/NTP): reset instead of producing negatives.
+            samples.clear()
         }
-        lastAt = t
-        lastBytes = cumulativeBytes
+        samples.addLast(Sample(t, cumulativeBytes))
+        prune(t)
     }
 
     /**
-     * Bytes/sec across the window at [atMs]; `-1.0` when fewer than two distinct timestamps exist
-     * or no forward progress is visible inside the window (stall ⇒ ETA hidden, not faked).
+     * Bytes/sec across the sliding window ending at [atMs]; `-1.0` when no forward progress is
+     * visible inside the window (stall ⇒ ETA hidden, not faked).
      */
+    @Synchronized
     fun instantBytesPerSec(atMs: Long): Double {
-        if (firstAt < 0L || lastAt <= firstAt || atMs < lastAt) return -1.0
-        val effectiveStart = maxOf(firstAt, atMs - windowMs)
-        if (effectiveStart >= lastAt) return -1.0
-        val dtMs = (lastAt - effectiveStart).toDouble()
-        val db = (lastBytes - firstBytes).toDouble()
-        if (db <= 0.0 || dtMs <= 0.0) return -1.0
+        prune(atMs)
+        if (samples.size < 2) return -1.0
+        val newest = samples.last()
+        val oldest = samples.first()
+        val dtMs = (newest.atMs - oldest.atMs).toDouble()
+        if (dtMs <= 0.0) return -1.0
+        val db = (newest.cumulativeBytes - oldest.cumulativeBytes).toDouble()
+        if (db <= 0.0) return -1.0
         return db * 1000.0 / dtMs
+    }
+
+    private fun prune(now: Long) {
+        val cutoff = now - windowMs
+        while (samples.size > 1 && samples.first().atMs < cutoff) {
+            samples.removeFirst()
+        }
     }
 }
 

@@ -33,6 +33,17 @@ class ReceivePipeline(
     private val recheckWholeFileDigest: Boolean = false,
     private val wholeFileDigest: WholeFileDigestProvider? = null,
     private val maxConcurrentSessions: Int = DEFAULT_MAX_SESSIONS,
+    /**
+     * Optional per-transfer sink resolution (C5.9 seam). Invoked once when a valid FILE_START
+     * opens a new session; the returned [ChunkSink] receives that transfer's chunks exclusively.
+     * This lets hosts bind each transfer to its own destination (e.g. a random-access file
+     * handle sized by `totalBytes`, offset by `index * chunkSize`) instead of sharing one
+     * sequential sink — REQUIRED for correct out-of-order multi-stream assembly.
+     * When null (default), all transfers share [sink] (legacy behavior).
+     */
+    private val sinkFactory: ((ChunkFrame.FileStart) -> ChunkSink)? = null,
+    /** When true, [ReceiveEvent.SessionStarted] is emitted on session open (default off). */
+    private val emitSessionStarted: Boolean = false,
 ) {
     init {
         require(ackEvery > 0) { "ackEvery must be > 0" }
@@ -56,7 +67,10 @@ class ReceivePipeline(
      * Processes one inbound frame payload.
      * Never throws on untrusted input; malformed/hostile frames surface as
      * [ReceiveEvent.Rejected]([RejectReason.MALFORMED_FRAME]).
+     *
+     * Thread-safe: frames may arrive concurrently from WebSocket and data-channel readers.
      */
+    @Synchronized
     fun onFrame(bytes: ByteArray): List<ReceiveEvent> {
         return when (val frame = ChunkFrame.parse(bytes)) {
             null -> listOf(ReceiveEvent.Rejected(RejectReason.MALFORMED_FRAME, null))
@@ -68,6 +82,7 @@ class ReceivePipeline(
     }
 
     /** Emits (and clears) any pending partial ACK batch; null when nothing pending. */
+    @Synchronized
     fun flushPendingAck(): ReceiveEvent? {
         for ((transferId, session) in sessions) {
             if (!session.finished && session.pending.isNotEmpty()) {
@@ -77,13 +92,23 @@ class ReceivePipeline(
         return null
     }
 
+    @Synchronized
     fun doneIndexes(transferId: String): List<Int>? =
         sessions[transferId]?.vector?.doneIndexes()
 
     /** Serialized bit-vector for persistence (C5.6 `TransferChunkEntity`); null if unknown id. */
+    @Synchronized
     fun serializedProgress(transferId: String): ByteArray? =
         sessions[transferId]?.vector?.toSerialized()
 
+    /**
+     * Drops a receive session (remote CANCEL). Returns true when a live session existed.
+     * The destination sink handle is closed by the HOST (it owns the handle map).
+     */
+    @Synchronized
+    fun cancelSession(transferId: String): Boolean = sessions.remove(transferId) != null
+
+    @Synchronized
     fun clear() = sessions.clear()
 
     private fun handleFileStart(frame: ChunkFrame.FileStart): List<ReceiveEvent> {
@@ -106,8 +131,13 @@ class ReceivePipeline(
         sessions[frame.transferId] = Session(
             start = frame,
             vector = ResumeBitVector(frame.totalChunks),
+            resolvedSink = sinkFactory?.invoke(frame) ?: sink,
         )
-        return emptyList()
+        return if (emitSessionStarted) {
+            listOf(ReceiveEvent.SessionStarted(frame))
+        } else {
+            emptyList()
+        }
     }
 
     private fun handleChunk(frame: ChunkFrame.Chunk): List<ReceiveEvent> {
@@ -144,7 +174,7 @@ class ReceivePipeline(
         }
 
         if (!alreadyReceived) {
-            sink.write(frame.index, frame.data)
+            session.resolvedSink.write(frame.index, frame.data)
         }
         val newlyMarked = session.vector.markReceived(frame.index)
         session.pending.add(frame.index)
@@ -214,6 +244,7 @@ class ReceivePipeline(
     private class Session(
         val start: ChunkFrame.FileStart,
         val vector: ResumeBitVector,
+        val resolvedSink: ChunkSink,
     ) {
         val pending = sortedSetOf<Int>()
         var finished = false
@@ -244,6 +275,13 @@ fun interface WholeFileDigestProvider {
 }
 
 sealed interface ReceiveEvent {
+
+    /**
+     * Emitted once per transfer when a valid FILE_START opened a session. Hosts can use this
+     * to finalize destination bookkeeping (the sink itself was already resolved via
+     * [ReceivePipeline.sinkFactory] before this event fires).
+     */
+    data class SessionStarted(val frame: ChunkFrame.FileStart) : ReceiveEvent
 
     /** Receiver → sender confirmation carrying deduplicated ascending verified indexes. */
     data class AckBatchReady(val frame: ChunkFrame.AckBatch) : ReceiveEvent
