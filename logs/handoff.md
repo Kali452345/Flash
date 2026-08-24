@@ -43,13 +43,11 @@
 `testDebugUnitTest assembleDebug` â€” BUILD SUCCESSFUL (2026-08-22); 376 Gradle tasks, **462 tests / 0 failures**.
 
 ## Current phase
-**Phase 5 (Chunked & Multi-stream Transfer) Part 1 & Part 2 COMPLETED (2026-08-24).**
-- Transfer framing v2, chunking, verify-before-write, resume bit-vector, multi-stream dispatcher, and multi-stream receiver implemented and verified.
-- `DestinationPolicy`, `RandomAccessSinkHandle`, `RandomAccessChunkSink`, and `TransferManifest` implemented.
-- `RealFlashTransferRepository` implemented and tested against Room DAOs and `MultiStreamDispatcher`.
-- `FlashTransferForegroundService` (`dataSync`) created and declared in manifest.
-- Build & test suite: 100% GREEN (70 tests in :core:transfer, 0 failures across all modules).
-- Ready for next phase: UI Tab Shell / TransfersScreen integration (PART 2 of ui-page-plan.md) or physical device benchmark.
+**Phase 6 (Messaging Repository & Durable Outbox) COMPLETED (2026-08-24).**
+- `RealFlashChatRepository` implemented over Room DAOs (`MessageDao`, `ConversationDao`, `OutboxDao`, `ReceiptDao`, `DraftDao`, `RecentSearchDao`).
+- Durable outbox pattern (C6.1), idempotent UUID message ingestion (C6.2), delivery receipts (C6.3), and ephemeral typing state (C6.6) implemented and verified.
+- Full test suite: 100% GREEN (225 tasks, 0 failures across all modules).
+- Up next: **Phase 7 (`:core:engine`)** — `FlashEngine` facade binding all subsystems for UI consumption.
 
 ## Component status
 - **UI-034 (Adaptive layouts):** `IMPLEMENTED` in `ui/adaptive/FlashAdaptiveLayouts.kt` â€” two-pane not yet consumed by screens (integration pending).

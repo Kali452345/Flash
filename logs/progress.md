@@ -1,5 +1,27 @@
 # Progress Log
 
+## 2026-08-24 -- Phase P6 (Messaging Repository, Room Integration & Durable Outbox)
+
+### Worked on
+Implemented Phase 6 (`:core:messaging`): `RealFlashChatRepository` backed by Room DAOs (`MessageDao`, `ConversationDao`, `OutboxDao`, `ReceiptDao`, `DraftDao`, `RecentSearchDao`), durable outbox pattern (C6.1), idempotent message ingestion (C6.2), delivery receipts (C6.3), and ephemeral typing states (C6.6).
+
+### Changed
+- **core/messaging/build.gradle.kts:** Added `:core:persistence` dependency.
+- **protocol/MessageWireFrame.kt:** Defined message wire models (`TextMessage`, `DeliveryReceipt`, `ReadReceipt`, `TypingFrame`, `ReactionFrame`).
+- **RealFlashChatRepository.kt:** Implemented `FlashChatRepository` with:
+  - Durable outbox drain loop and instant optimistic local DB writes before network dispatch.
+  - Active conversation Room flows combining messages and drafts.
+  - Inbound frame ingestion for text messages and automatic delivery receipt responses.
+  - Ephemeral in-memory typing state indicators.
+- **RealFlashChatRepositoryTest.kt:** Added comprehensive JVM tests verifying outbox enqueue/drain and inbound frame ingestion + receipt generation.
+
+### Verification
+- Ran `:core:messaging:testDebugUnitTest`: 100% green.
+- Full project test suite (`testDebugUnitTest`): BUILD SUCCESSFUL across all modules (225 tasks, 0 failures).
+
+### Remaining
+- Phase 7 (`:core:engine`): `FlashEngine` facade binding all subsystems for UI consumption.
+
 ## 2026-08-24 -- Phase P5 part 2 (Transfer Repository, Destination Policy & Foreground Service)
 
 ### Worked on
