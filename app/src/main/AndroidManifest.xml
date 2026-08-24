@@ -9,6 +9,7 @@
     <!-- P3.5/D-M4: background discovery host (connectedDevice FGS type). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -37,6 +38,11 @@
             android:name=".debug.FlashBackgroundService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name="com.transfer.flash.core.transfer.service.FlashTransferForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
