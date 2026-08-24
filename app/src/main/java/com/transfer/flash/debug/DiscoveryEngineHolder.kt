@@ -31,12 +31,22 @@ object DiscoveryEngineHolder {
     @Volatile
     private var network: DefaultFlashNetwork? = null
 
+    @Volatile
+    private var transferRepo: com.transfer.flash.core.transfer.FlashTransferRepository? = null
+
+    @Volatile
+    private var chatRepo: com.transfer.flash.core.messaging.FlashChatRepository? = null
+
     private var serverSocket: ServerSocket? = null
     private var binderJob: kotlinx.coroutines.Job? = null
 
     fun current(): CompositeDiscovery? = composite
 
     fun currentNetwork(): DefaultFlashNetwork? = network
+
+    fun currentTransfers(): com.transfer.flash.core.transfer.FlashTransferRepository? = transferRepo
+
+    fun currentChats(): com.transfer.flash.core.messaging.FlashChatRepository? = chatRepo
 
     suspend fun ensureStarted(context: Context): CompositeDiscovery {
         composite?.let { return it }
@@ -76,10 +86,42 @@ object DiscoveryEngineHolder {
             "Discovery startAll failed: ${(result as? com.transfer.flash.core.common.result.FlashResult.Failure)?.error}"
         }
 
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(
+            appContext,
+            com.transfer.flash.core.persistence.db.FlashDatabase::class.java,
+        ).build()
+
+        val transferImpl = com.transfer.flash.core.transfer.RealFlashTransferRepository(
+            streamChannelFactory = { channelId ->
+                object : com.transfer.flash.core.transfer.multistream.StreamChannel {
+                    override val id: Int = channelId
+                    override suspend fun sendFrame(frameBytes: ByteArray): Boolean = true
+                }
+            },
+            fileSourceOpener = { uri ->
+                java.io.ByteArrayInputStream(ByteArray(0))
+            },
+            transferDao = db.transferDao(),
+            transferChunkDao = db.transferChunkDao(),
+        )
+
+        val chatImpl = com.transfer.flash.core.messaging.RealFlashChatRepository(
+            localDeviceId = identity.deviceId.value,
+            localDisplayName = identity.friendlyName,
+            conversationDao = db.conversationDao(),
+            messageDao = db.messageDao(),
+            outboxDao = db.outboxDao(),
+            receiptDao = db.receiptDao(),
+            draftDao = db.draftDao(),
+            recentSearchDao = db.recentSearchDao(),
+        )
+
         val alreadyRunning = synchronized(this) {
             if (composite == null) {
                 composite = engine
                 network = networkImpl
+                transferRepo = transferImpl
+                chatRepo = chatImpl
                 false
             } else {
                 true
@@ -110,6 +152,8 @@ object DiscoveryEngineHolder {
             currentNetwork = network
             composite = null
             network = null
+            transferRepo = null
+            chatRepo = null
             socket = serverSocket
             serverSocket = null
         }
