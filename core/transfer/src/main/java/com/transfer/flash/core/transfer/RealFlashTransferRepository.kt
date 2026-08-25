@@ -89,6 +89,43 @@ class RealFlashTransferRepository(
     private val runningJobs = ConcurrentHashMap<String, Job>()
     private val runningDispatchers = ConcurrentHashMap<String, MultiStreamDispatcher>()
 
+    /**
+     * Transfer ids whose transmission should be paused, recorded independently of whether a
+     * dispatcher exists yet.
+     *
+     * `sendFile` returns as soon as the send coroutine is launched, but the dispatcher only lands
+     * in [runningDispatchers] after the resume-chunk DAO query and dispatcher construction have
+     * run. A pause issued inside that window used to be a silent no-op — the state flipped to
+     * Paused and `executeSend` immediately overwrote it with Transferring, so the sending device
+     * "could not pause" at all. The intent survives that race and is applied the moment the
+     * dispatcher is registered.
+     */
+    private val pauseIntents: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** Emits a wire control intent, logging drops instead of losing them silently. */
+    private fun emitOutgoing(transferId: String, peerDeviceId: String?, action: String) {
+        if (!_outgoingControl.tryEmit(OutgoingControl(transferId, peerDeviceId, action))) {
+            runCatching {
+                android.util.Log.w(
+                    "TRANSFER",
+                    "Dropped outgoing control action=$action transferId=$transferId (no collector / buffer full)",
+                )
+            }
+        }
+    }
+
+    /** Emits a local intake-gate intent, logging drops instead of losing them silently. */
+    private fun emitIncoming(transferId: String, action: String) {
+        if (!_incomingControl.tryEmit(IncomingControl(transferId, action))) {
+            runCatching {
+                android.util.Log.w(
+                    "TRANSFER",
+                    "Dropped incoming control action=$action transferId=$transferId (no collector / buffer full)",
+                )
+            }
+        }
+    }
+
     override suspend fun sendFile(
         targetDevice: FlashDevice,
         fileUri: String,
@@ -169,10 +206,8 @@ class RealFlashTransferRepository(
         )
         runningDispatchers[transferId] = dispatcher
 
-        updateTransferState(transferId) {
-            it.copy(state = FlashTransferState.Transferring)
-        }
-        transferDao?.setStatus(transferId, FlashTransferState.Transferring.name)
+        // Honour a pause requested before this dispatcher existed (see [pauseIntents]).
+        applyPendingPauseOrStart(transferId, dispatcher)
 
         var persistedDone = doneIndexes.toSet()
         val progressJob = repositoryScope.launch(workerDispatcher) {
@@ -180,8 +215,10 @@ class RealFlashTransferRepository(
                 updateTransferState(transferId) {
                     it.copy(
                         bytesDone = progress.bytesDone,
-                        speedBytesPerSec = progress.instantBytesPerSec.toLong(),
-                        etaSeconds = if (progress.etaMs >= 0) progress.etaMs / 1000 else 0L,
+                        // Rate is -1.0 until the rolling window holds two samples; a negative
+                        // speed must never reach the UI.
+                        speedBytesPerSec = progress.instantBytesPerSec.coerceAtLeast(0.0).toLong(),
+                        etaSeconds = if (progress.etaMs >= 0) progress.etaMs / 1000 else -1L,
                     )
                 }
                 transferDao?.setBytesDone(transferId, progress.bytesDone)
@@ -246,9 +283,44 @@ class RealFlashTransferRepository(
             }
             transferDao?.setStatus(transferId, FlashTransferState.Failed.name)
         } finally {
-            runningJobs.remove(transferId)
-            runningDispatchers.remove(transferId)
+            // Retire only OUR registrations: a resume that relaunched this transferId may already
+            // have registered a replacement dispatcher/job under the same key, and blindly
+            // removing here would orphan the live transfer (pause/resume/cancel would stop
+            // reaching it).
+            if (runningDispatchers.remove(transferId, dispatcher)) {
+                runningJobs.remove(transferId)
+                pauseIntents.remove(transferId)
+            }
         }
+    }
+
+    /**
+     * Moves a freshly registered send into either Transferring or Paused, depending on whether a
+     * pause was requested while the dispatcher was still being built (see [pauseIntents]).
+     *
+     * The intent is re-checked AFTER the Transferring write: [pauseTransfer] records its intent
+     * before it looks the dispatcher up, so between the two orderings one side always observes the
+     * other and the pause can no longer be lost.
+     */
+    private suspend fun applyPendingPauseOrStart(
+        transferId: String,
+        dispatcher: MultiStreamDispatcher,
+    ) {
+        suspend fun enterPaused() {
+            dispatcher.setPaused(true)
+            updateTransferState(transferId) {
+                it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L, etaSeconds = -1L)
+            }
+            transferDao?.setStatus(transferId, FlashTransferState.Paused.name)
+        }
+
+        if (pauseIntents.contains(transferId)) {
+            enterPaused()
+            return
+        }
+        updateTransferState(transferId) { it.copy(state = FlashTransferState.Transferring) }
+        transferDao?.setStatus(transferId, FlashTransferState.Transferring.name)
+        if (pauseIntents.contains(transferId)) enterPaused()
     }
 
     override suspend fun pauseTransfer(transferId: FlashTransferId): FlashResult<Unit> {
@@ -265,31 +337,29 @@ class RealFlashTransferRepository(
             // Inbound: gate local intake AND tell the sender to stop transmitting
             // (application-level; TCP backpressure cannot reach dedicated data channels).
             updateTransferState(transferId.value) {
-                it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L)
+                it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L, etaSeconds = -1L)
             }
-            _incomingControl.tryEmit(IncomingControl(transferId.value, ACTION_PAUSE))
-            _outgoingControl.tryEmit(OutgoingControl(transferId.value, transfer.peerDeviceId, ACTION_PAUSE))
+            emitIncoming(transferId.value, ACTION_PAUSE)
+            emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_PAUSE)
             return FlashResult.Success(Unit)
         }
 
         // Outbound: COOPERATIVE pause — flip the dispatcher flag (instant, reversible).
         // Cancelling the job here was unreliable (blocking socket writes swallow cancellation)
         // and made resume relaunch a second dispatcher while the first kept running.
-        val dispatcher = runningDispatchers[transferId.value]
-        if (dispatcher != null) {
-            dispatcher.setPaused(true)
-            updateTransferState(transferId.value) {
-                it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L, etaSeconds = -1L)
-            }
-            _outgoingControl.tryEmit(OutgoingControl(transferId.value, transfer.peerDeviceId, ACTION_PAUSE))
-            return FlashResult.Success(Unit)
-        }
-
-        // No live dispatcher (e.g. queued/failed): state-only pause.
+        //
+        // The intent is recorded FIRST and unconditionally: when the dispatcher is still being
+        // constructed there is nothing to flip yet, and executeSend applies the intent as soon as
+        // it registers (previously this branch pause was silently overwritten by Transferring).
+        pauseIntents.add(transferId.value)
+        runningDispatchers[transferId.value]?.setPaused(true)
         updateTransferState(transferId.value) {
-            it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L)
+            it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L, etaSeconds = -1L)
         }
         transferDao?.setStatus(transferId.value, FlashTransferState.Paused.name)
+        // Always tell the peer, dispatcher or not: it stops ACK/intake churn on its side and keeps
+        // both UIs in lockstep.
+        emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_PAUSE)
         return FlashResult.Success(Unit)
     }
 
@@ -297,32 +367,63 @@ class RealFlashTransferRepository(
         val transfer = _activeTransfers.value.find { it.id == transferId }
             ?: return FlashResult.Failure(com.transfer.flash.core.common.result.FlashError.Unknown("Transfer not found: ${transferId.value}"))
 
-        if (transfer.state != FlashTransferState.Paused && transfer.state != FlashTransferState.Failed) {
+        // Terminal transfers have nothing to resume.
+        if (transfer.state == FlashTransferState.Completed ||
+            transfer.state == FlashTransferState.Cancelled
+        ) {
             return FlashResult.Success(Unit)
         }
+
+        val dispatcher = runningDispatchers[transferId.value]
+        val liveSender = transfer.direction == FlashTransferDirection.Sending &&
+            dispatcher != null &&
+            runningJobs.containsKey(transferId.value)
+        val wirePaused = liveSender &&
+            (dispatcher!!.isPaused || pauseIntents.contains(transferId.value))
+
+        // A live dispatcher that is actually paused MUST be resumable regardless of the tracked
+        // state: bailing out on a state mismatch left the wire paused with no way back.
+        if (!wirePaused &&
+            transfer.state != FlashTransferState.Paused &&
+            transfer.state != FlashTransferState.Failed
+        ) {
+            return FlashResult.Success(Unit)
+        }
+
+        // Clear the pending-pause intent first so a dispatcher registering concurrently (or a
+        // relaunch below) does not start paused again.
+        pauseIntents.remove(transferId.value)
 
         if (transfer.direction == FlashTransferDirection.Receiving) {
             // Resume draining the inbound channel; buffered chunks flow, ACKs resume,
             // and the wire control frame un-pauses the sender's dispatcher.
-            updateTransferState(transferId.value) { it.copy(state = FlashTransferState.Transferring) }
-            _incomingControl.tryEmit(IncomingControl(transferId.value, ACTION_RESUME))
-            _outgoingControl.tryEmit(OutgoingControl(transferId.value, transfer.peerDeviceId, ACTION_RESUME))
+            updateTransferState(transferId.value) {
+                it.copy(state = FlashTransferState.Transferring, errorMessage = null)
+            }
+            emitIncoming(transferId.value, ACTION_RESUME)
+            emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_RESUME)
             return FlashResult.Success(Unit)
         }
 
         // Outbound: live dispatcher paused cooperatively → just unpause (no relaunch).
-        val dispatcher = runningDispatchers[transferId.value]
-        if (dispatcher != null && runningJobs.containsKey(transferId.value)) {
-            dispatcher.setPaused(false)
-            updateTransferState(transferId.value) { it.copy(state = FlashTransferState.Transferring) }
-            _outgoingControl.tryEmit(OutgoingControl(transferId.value, transfer.peerDeviceId, ACTION_RESUME))
+        if (liveSender) {
+            dispatcher!!.setPaused(false)
+            updateTransferState(transferId.value) {
+                it.copy(state = FlashTransferState.Transferring, errorMessage = null)
+            }
+            transferDao?.setStatus(transferId.value, FlashTransferState.Transferring.name)
+            emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_RESUME)
             return FlashResult.Success(Unit)
         }
 
         updateTransferState(transferId.value) {
-            it.copy(state = FlashTransferState.Queued)
+            it.copy(state = FlashTransferState.Queued, errorMessage = null)
         }
         transferDao?.setStatus(transferId.value, FlashTransferState.Queued.name)
+
+        // Tell the peer before the relaunch: a receiver that paused its own intake must re-open
+        // the gate, otherwise the fresh dispatcher blocks on backpressure with nothing draining.
+        emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_RESUME)
 
         // Re-launch transfer
         val job = repositoryScope.launch(workerDispatcher) {
@@ -346,7 +447,10 @@ class RealFlashTransferRepository(
     override suspend fun cancelTransfer(transferId: FlashTransferId): FlashResult<Unit> {
         val transfer = _activeTransfers.value.find { it.id == transferId }
         val job = runningJobs.remove(transferId.value)
-        val dispatcher = runningDispatchers[transferId.value]
+        // Drop the pause intent BEFORE unpausing: a dispatcher registering concurrently must not
+        // re-enter the paused state and swallow the cancellation.
+        pauseIntents.remove(transferId.value)
+        val dispatcher = runningDispatchers.remove(transferId.value)
         dispatcher?.setPaused(false) // unpause so cancellation lands at the next suspension point
         job?.cancel()
 
@@ -357,9 +461,9 @@ class RealFlashTransferRepository(
 
         // Tell the counterpart so both sides tear down deterministically (ADR-018).
         if (transfer != null) {
-            _outgoingControl.tryEmit(OutgoingControl(transferId.value, transfer.peerDeviceId, ACTION_CANCEL))
+            emitOutgoing(transferId.value, transfer.peerDeviceId, ACTION_CANCEL)
             if (transfer.direction == FlashTransferDirection.Receiving) {
-                _incomingControl.tryEmit(IncomingControl(transferId.value, ACTION_CANCEL))
+                emitIncoming(transferId.value, ACTION_CANCEL)
             }
         }
         return FlashResult.Success(Unit)
@@ -375,36 +479,77 @@ class RealFlashTransferRepository(
         when (action) {
             ACTION_PAUSE -> when (transfer.direction) {
                 FlashTransferDirection.Sending -> {
+                    // Recorded as an intent too: the peer can pause us before our dispatcher is
+                    // registered (it sees FILE_START from the first opened channel).
+                    pauseIntents.add(transferId)
                     runningDispatchers[transferId]?.setPaused(true)
                     updateTransferState(transferId) {
-                        it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L, errorMessage = "paused by receiver")
+                        it.copy(
+                            state = FlashTransferState.Paused,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = -1L,
+                            errorMessage = "paused by receiver",
+                        )
                     }
                 }
                 FlashTransferDirection.Receiving -> {
-                    updateTransferState(transferId) { it.copy(state = FlashTransferState.Paused, speedBytesPerSec = 0L) }
+                    // No intake gating here: the sender has already stopped, and the gate is
+                    // session-wide — closing it would also stall ACKs for unrelated transfers
+                    // sharing this socket. Resume DOES ungate (idempotent, see below).
+                    updateTransferState(transferId) {
+                        it.copy(
+                            state = FlashTransferState.Paused,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = -1L,
+                            errorMessage = "paused by sender",
+                        )
+                    }
                 }
             }
             ACTION_RESUME -> when (transfer.direction) {
                 FlashTransferDirection.Sending -> {
+                    pauseIntents.remove(transferId)
                     runningDispatchers[transferId]?.setPaused(false)
-                    updateTransferState(transferId) { it.copy(state = FlashTransferState.Transferring) }
+                    updateTransferState(transferId) {
+                        it.copy(state = FlashTransferState.Transferring, errorMessage = null)
+                    }
                 }
                 FlashTransferDirection.Receiving -> {
-                    updateTransferState(transferId) { it.copy(state = FlashTransferState.Transferring) }
+                    // MUST re-open the intake gate: without this a receiver that paused locally
+                    // stayed gated forever while its UI claimed Transferring, and the resumed
+                    // sender blocked on backpressure with zero progress.
+                    emitIncoming(transferId, ACTION_RESUME)
+                    updateTransferState(transferId) {
+                        it.copy(state = FlashTransferState.Transferring, errorMessage = null)
+                    }
                 }
             }
             ACTION_CANCEL -> when (transfer.direction) {
                 FlashTransferDirection.Sending -> {
+                    pauseIntents.remove(transferId)
+                    // Unpause first (as local cancelTransfer does): a paused worker parks in a
+                    // poll loop, and leaving the flag set risks re-parking before teardown.
+                    runningDispatchers.remove(transferId)?.setPaused(false)
                     runningJobs.remove(transferId)?.cancel()
                     updateTransferState(transferId) {
-                        it.copy(state = FlashTransferState.Cancelled, errorMessage = "cancelled by receiver")
+                        it.copy(
+                            state = FlashTransferState.Cancelled,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = 0L,
+                            errorMessage = "cancelled by receiver",
+                        )
                     }
                 }
                 FlashTransferDirection.Receiving -> {
                     // Host tears down sink + pipeline session on this event.
-                    _incomingControl.tryEmit(IncomingControl(transferId, ACTION_CANCEL))
+                    emitIncoming(transferId, ACTION_CANCEL)
                     updateTransferState(transferId) {
-                        it.copy(state = FlashTransferState.Cancelled, errorMessage = "cancelled by sender")
+                        it.copy(
+                            state = FlashTransferState.Cancelled,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = 0L,
+                            errorMessage = "cancelled by sender",
+                        )
                     }
                 }
             }

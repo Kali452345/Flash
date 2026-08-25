@@ -135,11 +135,30 @@ class MultiStreamDispatcher(
      * stays fully assembled (feeds intact) so resume continues exactly where it stopped.
      */
     fun setPaused(paused: Boolean) {
+        val wasPaused = externallyPaused
         externallyPaused = paused
+        if (wasPaused == paused) return
+        if (wasPaused) {
+            // Resuming: drop the samples spanning the paused gap, otherwise the first post-resume
+            // reading averages real bytes over pause wall-clock and reports a near-zero speed.
+            rateMeter.reset()
+        }
+        // Publish immediately so the UI reflects the pause within one frame instead of waiting
+        // for the watcher tick (and, while paused, stops showing a stale speed/ETA).
+        publishProgress()
     }
 
+    /** True while transmission is cooperatively paused (diagnostics / host-side reconciliation). */
+    val isPaused: Boolean get() = externallyPaused
+
+    /**
+     * Parks the caller while paused. Returns early once the transfer has resolved: `send()` joins
+     * every child, so a materializer/worker still parked here after a terminal outcome (e.g. the
+     * receiver's COMPLETE landed during a pause) would keep `send()` suspended forever.
+     */
     private suspend fun awaitUnpause() {
         while (externallyPaused && currentCoroutineContext().isActive) {
+            if (terminalDeferred?.isCompleted == true) return
             delay(PAUSE_POLL_MS)
         }
     }
@@ -348,6 +367,13 @@ class MultiStreamDispatcher(
                 deferred.complete(failedLocked("all channels failed"))
                 return
             }
+            // A PAUSED transfer must never be failed by the drain grace: a paused receiver
+            // deliberately stops draining and ACKing, so the missing ACKs are expected, not a
+            // fault. Disarm the deadline so resuming starts a fresh grace window.
+            if (externallyPaused) {
+                synchronized(terminalLock) { ackDrainDeadlineMs = null }
+                return
+            }
             val now = nowMs()
             val deadline = synchronized(terminalLock) {
                 (ackDrainDeadlineMs ?: now.also { ackDrainDeadlineMs = it }) + ACK_DRAIN_GRACE_MS
@@ -486,6 +512,11 @@ class MultiStreamDispatcher(
 
                 awaitUnpause()
 
+                // Already resolved (receiver COMPLETE, or a pause that outlived the transfer):
+                // keep draining to closure — the materializer may be blocked in feeds[i].send()
+                // and breaking out here would strand it — but never touch the wire again.
+                if (deferred.isCompleted) continue
+
                 if (dead) {
                     redistribute(shared, prepared, deferred)
                     continue
@@ -557,7 +588,9 @@ class MultiStreamDispatcher(
         if (alive == 0 && !deferred.isCompleted) {
             // Do NOT fail instantly: sends are fire-and-forget, ACKs lag behind worker exit.
             // Arm the bounded ack-drain deadline; the watcher resolves (covered → Completed,
-            // expiry → ack-drain-timeout failure).
+            // expiry → ack-drain-timeout failure). Skipped while paused — the grace is armed on
+            // resume instead, so a long pause cannot time the transfer out.
+            if (externallyPaused) return
             synchronized(terminalLock) {
                 if (ackDrainDeadlineMs == null) ackDrainDeadlineMs = nowMs()
             }
@@ -567,8 +600,15 @@ class MultiStreamDispatcher(
     private fun publishProgress() {
         val done = confirmedBytes.get()
         rateMeter.record(done)
-        val rate = rateMeter.instantBytesPerSec(nowMs())
-        val eta = if (rate > 0.0 && done < meta.totalBytes) ((meta.totalBytes - done) / rate * 1000.0).toLong() else -1L
+        // Paused transfers report a hard zero instead of a decaying rolling average: the sender is
+        // deliberately idle, so "slowing down" telemetry (and an ETA extrapolated from it) is a lie.
+        val paused = externallyPaused
+        val rate = if (paused) 0.0 else rateMeter.instantBytesPerSec(nowMs())
+        val eta = if (rate > 0.0 && done < meta.totalBytes) {
+            ((meta.totalBytes - done) / rate * 1000.0).toLong()
+        } else {
+            -1L
+        }
         _progress.value = MultiStreamProgress(done, meta.totalBytes, rate, eta)
     }
 

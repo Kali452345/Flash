@@ -38,6 +38,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -318,17 +319,20 @@ object DiscoveryEngineHolder {
         // throttles legacy peers. Same-build peers also receive the FLASH_XFER wire control
         // frame (below), which pauses their dispatcher at the application level — required for
         // dedicated data channels where WS backpressure doesn't apply.
-        val incomingIntakePaused = kotlinx.coroutines.flow.MutableStateFlow(false)
+        //
+        // Tracked as a SET of paused transfer ids, not a boolean: with two inbound transfers
+        // paused, resuming one used to ungate the socket for both.
+        val pausedIntakeIds = MutableStateFlow<Set<String>>(emptySet())
         appScope.launch {
             transferImpl.incomingControl.collect { control ->
                 when (control.action) {
                     RealFlashTransferRepository.ACTION_PAUSE -> {
-                        incomingIntakePaused.value = true
-                        Log.i(TAG_TRANSFER, "Incoming intake PAUSED transferId=${control.transferId}")
+                        pausedIntakeIds.update { it + control.transferId }
+                        Log.i(TAG_TRANSFER, "Incoming intake PAUSED transferId=${control.transferId} paused=${pausedIntakeIds.value.size}")
                     }
                     RealFlashTransferRepository.ACTION_RESUME -> {
-                        incomingIntakePaused.value = false
-                        Log.i(TAG_TRANSFER, "Incoming intake RESUMED transferId=${control.transferId}")
+                        pausedIntakeIds.update { it - control.transferId }
+                        Log.i(TAG_TRANSFER, "Incoming intake RESUMED transferId=${control.transferId} paused=${pausedIntakeIds.value.size}")
                     }
                     RealFlashTransferRepository.ACTION_CANCEL -> {
                         // Remote cancel: tear down sink + pipeline session; un-gate intake.
@@ -336,7 +340,7 @@ object DiscoveryEngineHolder {
                             runCatching { handle.close() }
                         }
                         receivePipeline.cancelSession(control.transferId)
-                        incomingIntakePaused.value = false
+                        pausedIntakeIds.update { it - control.transferId }
                         Log.i(TAG_TRANSFER, "Incoming transfer CANCELLED transferId=${control.transferId}")
                     }
                 }
@@ -383,7 +387,7 @@ object DiscoveryEngineHolder {
                                 while (true) {
                                     // Block BEFORE pulling the next frame while paused
                                     // (channel fills → WS read loop blocks → TCP backpressure).
-                                    incomingIntakePaused.first { !it }
+                                    pausedIntakeIds.first { it.isEmpty() }
                                     val data = runCatching { session.awaitBinaryFrame() }
                                         .getOrElse { break } // channel closed: session gone
                                     handleInboundBinary(

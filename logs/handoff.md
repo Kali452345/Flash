@@ -1,5 +1,59 @@
 # Current Handoff
 
+## 2026-08-25 -- RESOLVED: sender could not pause (ERROR-018, ADR-021) -- nine pause/resume/cancel defects
+- **The reported bug was a REGISTRATION RACE, not a broken pause button.** `sendFile` returns the instant the
+  send coroutine launches, but `executeSend` registered its dispatcher only after the resume-chunk DAO query
+  and dispatcher construction. A pause landing in that window found no dispatcher, took a state-only branch
+  that emitted no wire frame, and then `executeSend` overwrote `Paused` with `Transferring` — the pause
+  disappeared and bytes kept flowing. **Pause is now an INTENT** (`pauseIntents`, recorded BEFORE the
+  dispatcher lookup) that `applyPendingPauseOrStart` re-checks after the Transferring write.
+- **Eight more defects fixed in the same audit** (full list + fixes in ERROR-018): `send()` parked forever
+  when COMPLETE arrived during a pause; the 15 s ACK-drain grace failed paused transfers (a paused receiver
+  deliberately stops ACKing); resume never un-gated receive intake, so both UIs showed Transferring at 0 B/s;
+  the intake gate was one session-wide boolean; `resumeTransfer` no-oped on a state mismatch while the wire
+  stayed paused; the rate meter straddled the paused gap and `-1` leaked to the UI as negative speed;
+  `tryEmit` dropped control frames silently; cancelling a PAUSED sender never reached a cancellable
+  suspension point, and the `finally` cleanup lacked an ownership check.
+- **Read ADR-021 before touching this code.** Its invariants: pause intent outlives dispatcher construction;
+  a paused transfer is NEVER failed by a timeout (the drain deadline is disarmed, resume re-arms fresh); a
+  terminal outcome always beats a pause (`awaitUnpause()` returns on the terminal deferred); resume always
+  emits `IncomingControl(RESUME)` while remote PAUSE deliberately does NOT gate (the gate is session-wide, so
+  gating would stall unrelated transfers' ACKs); the gate is a SET of transfer ids; paused telemetry is a
+  hard `0.0` / ETA `-1`.
+- **Verified:** `:core:transfer:testDebugUnitTest --rerun` green (76 tests, 0 failures) and full
+  `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks; 668 tests / 0 failures across 102 suites);
+  `app-debug.apk` produced. 6 new regression tests, incl. a `GatedChunkDao` that parks the resume query to
+  reproduce the race window exactly, and a fake-clock test proving a paused sender survives repeated 60 s
+  jumps and only fails after resume.
+- **Known limit:** the pause intent is in-memory, so pause does NOT survive process death — a killed paused
+  sender comes back as Queued and re-plans from the persisted done-set. Persisting it is the ADR-021 revisit
+  trigger.
+- **Still owner-only: the two-phone device run** (10 MB over 5 GHz, Pause/Resume/Cancel from BOTH sides, plus
+  a multi-minute pause), to be recorded as EXP-002 against EXP-001.
+
+## 2026-08-25 -- Phase 8 App Shell LIVE: custom bottom nav + four tab pages
+- **The app now boots into the real shell:** `MainActivity.FlashApp` renders
+  `Column { FlashAnimatedScreen(nav.current) ; FlashBottomNav }` — boolean-flag switching GONE.
+  Tabs = Chats / Transfers / Nearby / Settings; tab taps call `FlashNavigationState.selectTab`
+  (stack RESET, not push); Conversation still pushes; BackHandler pops.
+- **UI-046 FlashBottomNav** (docs/ui/bottom-nav.md): custom docked bar — spring-sliding Pulse pill,
+  squash-release icon pop, animated label weight, re-select pulse ring, Tick haptics, badges (9+),
+  selectableGroup/Role.Tab semantics, reduce-motion snaps. Four NEW house-style icons
+  (chat/transfer/nearby/settings; settings gear adapted from Feather MIT w/ attribution).
+- **UI-047 TransfersScreen** (transfers-page.md): ACTIVE/FAILED/HISTORY sections, honest status lines,
+  bytes-weighted progress, pause⇄resume swap, scoped Retry, Share on history; UI-016 badge color language
+  reused statically. Empty state via new `TransfersFirstRun` kind.
+- **UI-048 NearbyScreen** (nearby-page.md): identity card, peer rows + FlashTransportBadge + Connect,
+  trusted peers + Revoke, scanning pulse dot, radios-off explainer, pairing-dialog mount ready
+  (phase/secondsLeft pass-through to UI-032 dialog).
+- **UI-049 SettingsScreen** (settings-page.md): five sections; CUSTOM segmented theme control + CUSTOM
+  FlashSwitch; About card with version/protocol/device-id.
+- **Demo-state contract:** TransfersUiState/NearbyUiState/FlashSettingsModel in MainActivity are shaped
+  EXACTLY like future C5/C3/C1.4 engine outputs — wiring is substitution, not rewrite.
+- **Verified:** full `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL (411 tasks); suite green incl.
+  +19 new tests across nav/transfers/nearby/settings logic. NOT device-verified yet.
+- **Remaining P1 gap:** Send FAB on Chats (opens attachment palette) — only page-plan item not built.
+
 ## 2026-08-24 -- RESOLVED: :core:transfer suite hang (ERROR-016) + Gradle startup failure (ERROR-017)
 - **Hang fixed, bounded queues kept.** `MultiStreamDispatcher.runWorker` is now ONE loop that `select`s over its own
   feed and the shared redistribution queue (was two sequential phases); exit bookkeeping (`ownFeedsOpen`,

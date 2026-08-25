@@ -453,6 +453,123 @@ class MultiStreamDispatcherTest {
         Unit
     }
 
+    // ---- cooperative pause (ADR-018) -----------------------------------------------------
+
+    @Test(timeout = 60_000)
+    fun `pause before start holds the wire silent, resume delivers the whole file`() = runBlocking {
+        val h = Harness()
+        val dispatcher = h.build()
+
+        // Pausing BEFORE send() mirrors the Dev Console race the field report hit: the pause is
+        // requested while the dispatcher is still being wired up.
+        dispatcher.setPaused(true)
+        var result: MultiStreamResult? = null
+        val job = launch(Dispatchers.Default) { result = dispatcher.send() }
+
+        Thread.sleep(300) // several PAUSE_POLL_MS/WATCH_POLL_MS cycles
+        assertTrue("paused dispatcher reports it", dispatcher.isPaused)
+        assertEquals(
+            "no CHUNK may reach a wire while paused: " +
+                h.channels.joinToString { c -> "${c.id}:${c.sentIndexes}" },
+            0,
+            h.channels.sumOf { it.sentIndexes.size },
+        )
+        assertEquals(0L, dispatcher.progress.value.bytesDone)
+        assertEquals("paused telemetry is a hard zero", 0.0, dispatcher.progress.value.instantBytesPerSec, 0.0)
+        assertEquals(-1L, dispatcher.progress.value.etaMs)
+        assertTrue(job.isActive)
+
+        dispatcher.setPaused(false)
+        job.join()
+
+        assertFalse(dispatcher.isPaused)
+        assertTrue("expected Completed got $result", result is MultiStreamResult.Completed)
+        assertEquals(19, (result as MultiStreamResult.Completed).chunksSent)
+        assertTrue(h.assembler.matches(payload))
+        assertEquals(19, h.assembler.writes)
+    }
+
+    @Test(timeout = 60_000)
+    fun `receiver COMPLETE arriving while paused resolves send instead of parking forever`() =
+        runBlocking {
+            // Regression: the materializer and every worker polled awaitUnpause() unconditionally,
+            // and send() joins all of them — a terminal outcome reached during a pause left the
+            // call suspended forever with no way out but cancellation.
+            val h = Harness()
+            val dispatcher = h.build()
+            dispatcher.setPaused(true)
+
+            var result: MultiStreamResult? = null
+            val job = launch(Dispatchers.Default) { result = dispatcher.send() }
+            Thread.sleep(200)
+            assertTrue("still paused and running", job.isActive)
+
+            val complete = ChunkFrame.serialize(ChunkFrame.Complete(meta.transferId, meta.fileId, true))
+            assertTrue(dispatcher.onInboundFrame(0, complete))
+
+            job.join() // must return while STILL paused
+            assertTrue(dispatcher.isPaused)
+            assertTrue("expected Completed got $result", result is MultiStreamResult.Completed)
+        }
+
+    @Test(timeout = 60_000)
+    fun `paused sender is not failed by the ack-drain grace, only after resume`() = runBlocking {
+        // A paused receiver deliberately stops draining and ACKing, so the drain grace must not
+        // count while paused — otherwise every pause longer than ACK_DRAIN_GRACE_MS killed the
+        // transfer with "ack drain timeout".
+        val clock = java.util.concurrent.atomic.AtomicLong(1_000_000L)
+        val sent = Collections.synchronizedList(ArrayList<Int>())
+        val silentChannel = object : StreamChannel {
+            override val id: Int = 0
+            override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
+                (ChunkFrame.parse(frameBytes) as? ChunkFrame.Chunk)?.let { sent.add(it.index) }
+                return true // accepts everything, never ACKs
+            }
+        }
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        liveExecutors.add(executor)
+        val dispatcher = MultiStreamDispatcher(
+            chunker = Chunker(),
+            meta = meta,
+            source = ChunkSource { payload.inputStream() },
+            factory = StreamChannelFactory { _, _ -> silentChannel },
+            streamCount = 1,
+            requestedChunkSize = chunkSize,
+            nowMs = { clock.get() },
+            workerDispatcher = executor.asCoroutineDispatcher(),
+        )
+
+        var result: MultiStreamResult? = null
+        val job = launch(Dispatchers.Default) { result = dispatcher.send() }
+        awaitUntil(condition = { sent.size == 19 }, describe = { "sent=" + sent.size })
+
+        dispatcher.setPaused(true)
+        // Volatile write lands before the clock jump, so every watcher tick that sees the advanced
+        // clock also sees the pause. Repeated jumps prove the grace stays disarmed, not just skewed.
+        repeat(10) {
+            clock.addAndGet(60_000) // far past ACK_DRAIN_GRACE_MS on the injected clock
+            Thread.sleep(30)
+        }
+        assertTrue("paused transfer must survive the drain grace", job.isActive)
+        assertTrue("no terminal outcome while paused, got $result", result == null)
+
+        // Resume: the watcher must re-arm the deadline at the current instant and then expire it.
+        // Advancing inside the poll avoids a race where the jump lands before the re-arm tick.
+        dispatcher.setPaused(false)
+        awaitUntil(
+            condition = {
+                clock.addAndGet(20_000)
+                !job.isActive
+            },
+            describe = { "resumed transfer should hit the ack drain timeout" },
+        )
+        job.join()
+
+        val failed = result as? MultiStreamResult.Failed
+            ?: throw AssertionError("expected Failed after resume got $result")
+        assertTrue("reason=${failed.reason}", failed.reason.contains("ack drain timeout"))
+    }
+
     @Test(timeout = 60_000)
     fun `concurrent sessions - two peers transfer at the same time and both complete`() = runBlocking {
         // Two fully independent harness pairs (own receiver, assembler, executor): proves the

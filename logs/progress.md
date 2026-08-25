@@ -2696,3 +2696,149 @@ Resilience primitives + chaos harness for `:core:network`, all NEW files only (n
 
 ### Next AI
 Read docs/core-upgrade-plan.md C4 + this entry; wire primitives into the concrete FlashNetwork implementation behind connectionHealth; do NOT modify resilience/** APIs without reading their KDoc rationale.
+
+## 2026-08-25 - Phase 8 App Shell: custom animated bottom nav + all four tab pages
+
+### Worked on
+Implemented the ui-page-plan PART 2 app shell end to end: FlashBottomNav (UI-046), TransfersScreen (UI-047),
+NearbyScreen (UI-048), SettingsScreen (UI-049), and rewired MainActivity/FlashApp from boolean-flag switching
+to FlashNavigationState-driven tabs. Research-first per AGENTS.md 34: each component got a DESIGNED doc before
+implementation (docs/ui/bottom-nav.md, transfers-page.md, nearby-page.md, settings-page.md).
+
+### Changed
+- NEW `ui/chat/.../shell/FlashBottomNav.kt`: docked flat bar; spring-sliding Pulse indicator pill
+  (56x32dp, springSnappy), squash-release icon pop (Animatable snapTo .85 -> spring to 1), animated label
+  weight 400<->600, re-select pulse ring (Canvas, emphasisMillis, suppressed under reduce-motion),
+  badge count with 9+ collapse, selectableGroup + Role.Tab semantics + Tick haptics on change.
+  Pure math in FlashBottomNavMath (indicatorStartPx clamped to bar bounds; formatBadgeCount).
+- NEW drawables flash_ic_chat/transfer/nearby/settings.xml (24vp, 2dp round strokes house style;
+  settings gear outline adapted from Feather MIT, attribution in file header). FlashIcons += Chat,
+  Transfer, Nearby, Settings.
+- EDIT `navigation/FlashNavigation.kt`: FlashDestination += Settings; FlashNavigationMath.isTabRoot;
+  FlashNavigationState.selectTab(destination) = stack RESET to single root (tabs are shell state, not pushes).
+  Tests extended in FlashNavigationLogicTest (+4).
+- NEW `ui/transfers/FlashTransfersScreen.kt`: sectioned ACTIVE/FAILED/HISTORY queue; per-row honest status
+  lines ("3.2 MB/s - 1 min left" / "Paused" / error text); bytes-weighted progress bar animating through
+  tweenNormalSpec; pause/resume AnimatedContent swap via statusCrossfade; scoped Retry; Share on history;
+  rows keyed by transferId; merged row semantics announcing name/state/percent/status. Reuses UI-016 color
+  language (fileCategoryColorFor + formatFileSize) in a static TransferBadge (interactive in-bubble overlays
+  deliberately NOT reused so row controls own actions). FlashStateCopy += TransfersFirstRun empty kind.
+- NEW `ui/nearby/FlashNearbyScreen.kt`: identity card (name/id/port subtitle), discovered peer rows with
+  FlashTransportBadge + Connect pill, trusted-peer rows with Revoke, scanning pulse dot (infinite tween loop,
+  static under reduce-motion), radios-off explainer, pairing overlay mount point for UI-032 dialog
+  (state.pairingPhase/pairingSecondsLeft passed through).
+- NEW `ui/settings/FlashSettingsScreen.kt`: five grouped sections; CUSTOM segmented theme-mode control
+  (BoxWithConstraints + spring-sliding accent fill - sibling motion of the nav indicator) and CUSTOM
+  FlashSwitch (track+spring thumb, no Material Switch); identity/about/security/data rows; About card prints
+  version/protocol/device id.
+- REWRITE `app/.../MainActivity.kt` FlashApp: Column { FlashAnimatedScreen(content) ; FlashBottomNav } with
+  BackHandler(nav.canGoBack); Dev Console chip relocated above the bar (bottom=96dp); demo states
+  sampleTransfers()/NearbyUiState/FlashSettingsModel shaped exactly like future C5/C3/C1.4 mappings;
+  pause/resume/cancel/retry mutate local demo state until engine flows land.
+
+### Verification
+- `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL across all modules (411 tasks): full suite green incl.
+  new FlashBottomNavLogicTest (4), FlashNavigationLogicTest extensions (+4), FlashTransfersLogicTest (6),
+  FlashNearbyLogicTest (3), FlashSettingsLogicTest (2).
+- One test failure during development fixed at implementation level: indicatorStartPx now clamps to bar bounds
+  (wider-than-tab degenerate geometry pins to nearest legal edge instead of bleeding negative).
+- Compile errors caught and fixed: composable-context violation calling FlashTheme.motion inside
+  AnimatedContent transitionSpec (hoisted), stray comma syntax error in semantics block, missing imports.
+- NOT yet device-verified (owner backlog): spring feel/haptics/ring on hardware, dark mode sweep, RTL preview,
+  large-font pass.
+
+### Problems
+- Subagent infrastructure down this session (ProviderModelNotFoundError gpt-5-nano) - explore/librarian
+  delegation impossible; research done directly via websearch + codebase reads.
+
+### Remaining
+- Send FAB on Chats (page-plan P1: opens attachment palette) - NOT built; only remaining P1 item.
+- Engine substitution: C5 transfers flow -> TransfersUiState; C3/C2 discovery/trust -> NearbyUiState;
+  C1.4 DataStore -> FlashSettingsModel; theme mode segmented currently mutates local model only.
+- Device verification backlog additions: bottom nav feel, ring, haptics; settings segmented control;
+  transfers pause/resume round-trip on demo state.
+
+### Next AI
+Wire engine flows into the three demo states (substitution only - shapes are final), build the Chats Send FAB,
+then run the owner device backlog. Do not restyle the nav bar without reading docs/ui/bottom-nav.md first.
+
+## 2026-08-25 - Sender pause/resume/cancel audit: nine defects fixed (ERROR-018, ADR-021)
+
+### Worked on
+Owner report: "the transferring device cannot pause". Audited the whole pause/resume/cancel surface -
+MultiStreamDispatcher, RealFlashTransferRepository, the app-side intake gate, and the UI call sites - rather
+than patching the one symptom. Nine distinct defects; the reported one is #1.
+
+### Root causes found
+1. REGISTRATION RACE (the report): `sendFile` returns as soon as the send coroutine launches, but
+   `executeSend` registers the dispatcher only AFTER the resume-chunk DAO query and dispatcher construction.
+   A pause landing in that window found no dispatcher, took a state-only branch that emitted no wire frame,
+   and `executeSend` then overwrote Paused with Transferring. Pause vanished, bytes kept flowing.
+2. `send()` parked forever when a terminal outcome (COMPLETE/failure) arrived during a pause: the
+   materializer and every worker polled `awaitUnpause()` unconditionally, and `send()` joins all of them.
+3. The 15 s ACK-drain grace failed paused transfers - a paused receiver deliberately stops ACKing.
+4. Receiver-gated / sender-resumed deadlock: resume never emitted `IncomingControl(RESUME)`, so the receive
+   intake stayed gated while the sender pushed. Both UIs showed Transferring at 0 B/s.
+5. The intake gate was one session-wide boolean, so any pause gated ALL inbound transfers and any resume
+   un-gated them all.
+6. `resumeTransfer` no-oped on a state mismatch while the wire stayed paused - unrecoverable without cancel.
+7. `RollingRateMeter` straddled the paused gap, so post-resume speed was a fiction; `-1` sentinel rates
+   reached the UI as negative speed.
+8. `tryEmit` on a no-replay control flow dropped frames silently when no collector was attached.
+9. `cancelTransfer` on a PAUSED sender: workers re-parked in the pause poll loop, so the job never reached a
+   cancellable suspension point; and the `finally` cleanup removed dispatcher state without an ownership
+   check, orphaning a relaunched send.
+
+### Changed
+- EDIT `multistream/MultiStreamDispatcher.kt`: `setPaused()` resets the rate meter on resume and publishes
+  immediately; new `val isPaused`; `awaitUnpause()` returns early once the terminal deferred completes;
+  workers `continue` past the wire when the transfer is already resolved; `maybeResolveFromState` DISARMS
+  `ackDrainDeadlineMs` while paused (fresh window on resume); `failIfAllChannelsDead` early-returns while
+  paused; `publishProgress` publishes a hard `0.0` rate and `-1` ETA while paused.
+- EDIT `RealFlashTransferRepository.kt`: `pauseIntents` (`ConcurrentHashMap.newKeySet()`) recorded BEFORE the
+  dispatcher lookup; `applyPendingPauseOrStart` re-checks the intent after the Transferring write; one
+  outbound `pauseTransfer` branch that always emits the wire frame; `resumeTransfer` resumes on wire truth
+  (`liveSender` / `wirePaused`) and emits RESUME before any relaunch; `cancelTransfer` clears the intent,
+  `setPaused(false)`, then cancels; `onRemoteTransferControl` emits `IncomingControl(RESUME)` on
+  Receiving+RESUME and deliberately does NOT gate on Receiving+PAUSE (see ADR-021 §4); ownership-checked
+  `finally` (`runningDispatchers.remove(id, dispatcher)` guards the rest); `emitOutgoing`/`emitIncoming` log
+  `tryEmit` drops.
+- EDIT `multistream/MultiStreamProgress.kt`: `RollingRateMeter.reset()`.
+- EDIT `app/.../debug/DiscoveryEngineHolder.kt`: boolean intake gate -> `pausedIntakeIds:
+  MutableStateFlow<Set<String>>`; binary collector awaits `pausedIntakeIds.first { it.isEmpty() }`.
+- NEW tests (6): `MultiStreamDispatcherTest` - pause-before-start holds the wire silent and resume delivers
+  all 19 chunks; COMPLETE arriving while paused resolves `send()` instead of parking; a paused sender survives
+  repeated 60 s fake-clock jumps and only fails after resume. `RealFlashTransferRepositoryTest` (with a
+  `GatedChunkDao` that parks the resume query to reproduce the exact race window) - pause before dispatcher
+  registration survives construction with 0 chunks on the wire; remote pause parks a live sender and remote
+  resume finishes it with the notice cleared; cancel unparks a paused sender and Cancelled is terminal.
+
+### Verification
+- `:core:transfer:testDebugUnitTest --rerun` BUILD SUCCESSFUL - 76 tests, 0 failures
+  (MultiStreamDispatcherTest 11/11, RealFlashTransferRepositoryTest 4/4).
+- Full `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL, 411 actionable tasks; 668 tests / 0 failures /
+  0 skipped across 102 suites (baseline 644: +6 mine, ~+18 from the in-flight UI workstream).
+  `app/build/outputs/apk/debug/app-debug.apk` produced (22,771,114 bytes).
+- Gradle still requires the ERROR-017 env (`JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=Z:\nope`).
+
+### Problems
+- Chased a misleading `UP-TO-DATE` on `:core:transfer:testDebugUnitTest`; mixed/skewed file clocks made
+  timestamps useless. Settled it by CONTENT - located compiled classes named after the new tests and found
+  them listed in the results XML - then confirmed with `--rerun`. Not a defect.
+- Two self-caught flaky assertions before the first run: the fake-clock jump could land before the watcher
+  re-armed the drain deadline (fixed by advancing the clock INSIDE the await poll), and the cancel test
+  asserted an exact wire count even though `cancelTransfer` intentionally unpauses first and lets buffered
+  frames drain (fixed by asserting the wire SETTLES across two samples).
+
+### Remaining
+- Device confirmation (owner only, EXP-002 vs EXP-001): 10 MB over 5 GHz, Pause/Resume/Cancel from BOTH
+  sides, plus a multi-minute pause to prove the drain grace stays disarmed on real hardware.
+- Pause does not survive process death: the intent lives in memory only, so a killed paused sender resumes as
+  Queued and re-plans from the persisted done-set. Persisting the intent is the ADR-021 revisit trigger.
+- The UI transfers page still mutates local demo state; real pause/resume wiring lands with the C5 flow
+  substitution.
+
+### Next AI
+Do not reintroduce "look up the dispatcher, then pause it" anywhere - read ADR-021 first; pause is an intent
+recorded before the lookup. When the transport gains a per-transfer intake gate, revisit the deliberate
+asymmetry in `onRemoteTransferControl` (remote PAUSE does not gate).
