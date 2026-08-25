@@ -1,5 +1,56 @@
 # Decisions
 
+## ADR-021 - Pause lifecycle rules: intent outlives the dispatcher, paused transfers are never failed, resume always un-gates
+
+Amends ADR-018 §2 (cooperative dispatcher pause). ADR-018 stays valid; these are the invariants it was
+missing, all found by auditing the reported "the transferring device cannot pause" defect (ERROR-018).
+
+### Decision
+1. **Pause is an INTENT, not a dispatcher call.** `RealFlashTransferRepository` records `pauseIntents`
+   (a `ConcurrentHashMap.newKeySet()`) BEFORE it looks up `runningDispatchers`, and `executeSend` applies any
+   pending intent when it registers its dispatcher (`applyPendingPauseOrStart`: check intent, else write
+   `Transferring`, then re-check). `sendFile` returns before the dispatcher exists, so any design that
+   requires a live dispatcher to accept a pause has a lossy window by construction.
+2. **A paused transfer is never failed by a timeout.** A paused receiver deliberately stops ACKing, so the
+   ACK-drain grace is not armed while paused and is DISARMED if a pause begins after it was armed; resume
+   starts a fresh window. Pause duration is therefore unbounded, which is what users expect.
+3. **A terminal outcome always wins over a pause.** `awaitUnpause()` returns as soon as the session's
+   terminal deferred completes, and workers that observe a resolved transfer keep draining their feeds to
+   closure without touching the wire. `send()` must be able to return while still paused.
+4. **Resume un-gates unconditionally; remote pause does not gate.** The receive-side intake gate is
+   session-wide, so gating on a *remote* pause would stall unrelated transfers' ACKs on the same socket while
+   the peer has already stopped sending. Un-gating can never block anything, so RESUME always emits
+   `IncomingControl(RESUME)` (idempotent). The gate itself is a SET of paused transfer ids, not a boolean.
+5. **Resume trusts the wire, not the tracked state.** A live dispatcher that is `isPaused` (or still carries a
+   pause intent) is resumable regardless of the `FlashTransferState` the UI shows.
+6. **Paused telemetry is a hard zero.** While paused, published rate is `0.0` and ETA is `-1`; the rolling
+   rate meter is `reset()` on resume so no window straddles the paused gap. Negative rates never leave the
+   repository (`coerceAtLeast(0.0)`).
+
+### Context
+Pause was implemented as "flip the dispatcher flag if one exists". Because `sendFile` returns before
+registration, the common Dev-Console/UI sequence (send, then pause) hit the window where no dispatcher
+existed: the state flipped to Paused, `executeSend` overwrote it with Transferring, no wire frame was sent,
+and bytes kept flowing - the reported symptom. Fixing only that exposed the rest: the drain grace killing
+long pauses, `send()` parking forever when COMPLETE landed during a pause, and a receiver that stayed
+intake-gated after resume (0 B/s with both UIs claiming Transferring). Full defect list in ERROR-018.
+
+### Alternatives considered
+- **Block `sendFile` until the dispatcher is registered** (so pause always finds one): rejected - it turns a
+  fire-and-forget call into one that waits on a DAO query and a whole-file hash, and the race returns as soon
+  as anything else is added before registration.
+- **Cancel the job on pause and re-plan on resume:** rejected again here for the ADR-018 reason (loses
+  receiver-authoritative ACK state) and because it makes "paused" indistinguishable from "failed" in the DAO.
+- **Gate receive intake on remote pause too (symmetry):** rejected - the gate is session-wide, so it would
+  stall ACKs for unrelated transfers sharing the socket. Asymmetry here is deliberate and documented.
+- **Suspend the ACK-drain deadline by *extending* it instead of disarming:** rejected - any finite extension
+  is a guess about how long a human pauses.
+
+### Revisit when
+The intake gate becomes per-transfer at the transport layer (then remote pause CAN gate symmetrically), or
+pause must survive process death / a session reconnect (which needs the intent persisted in the DAO, not just
+in memory - today a paused sender that is killed resumes as Queued and re-plans from the persisted done-set).
+
 ## ADR-019 - Multi-stream sender workers: one merged select loop over bounded queues
 
 ### Decision
@@ -410,3 +461,36 @@ Plan P3.5 workstream A (identity hardening) + B2/B3 (mode wiring); contracts Fla
 ### Revisit when
 Multiple transports implement modes (fan-out semantics may need per-transport acks), or when pairing lands (fp8 becomes a pinning cross-check at C3.10, not just a hint).
 
+
+## ADR-020 - Phase 8 app shell: dependency-free tab state, custom bottom nav, demo-state substitution contract
+
+### Decision
+1. Tab selection is SHELL state implemented as a stack reset: `FlashNavigationState.selectTab(destination)`
+   replaces the whole UI-033 stack with one root entry. Tabs never push; Conversation remains the only
+   pushed screen. No androidx.navigation adoption change (UI-033 deferral stands; revisit triggers unchanged).
+2. Bottom chrome is `FlashBottomNav` (UI-046) � fully custom docked bar (spring indicator pill, icon pop,
+   pulse-ring reselect, haptics via choke point). Material NavigationBar is permanently rejected for the
+   final UI per AGENTS.md 34; glassmorphism/shader variants documented as rejected in bottom-nav.md
+   (dependency cost / API 33+ only).
+3. Pages consume DEMO STATE OBJECTS (`TransfersUiState`, `NearbyUiState`, `FlashSettingsModel`) whose shapes
+   are declared FINAL now: engine wiring (C5/C3/C2/C1.4) must substitute data sources without changing page
+   APIs. This inverts the usual order (engine first) deliberately so Phase-8 UI lands reviewable and the
+   engine team gets frozen targets.
+
+### Context
+ui-page-plan PART 2 (owner-approved) ordered: shell -> pages -> engine substitution -> device verification.
+Subagent outage forced direct implementation; research was still completed per-component before code
+(bottom-nav/transfers/nearby/settings docs).
+
+### Alternatives considered
+- androidx.navigation + NavigationBar: rejected (34 prohibition on generic M3 chrome; dependency rule).
+- Engine-flow-first wiring before any UI: rejected � blocks all UI verification on two-phone availability.
+
+### Consequences
+- Back from Conversation always lands on its tab root (predictable); cross-tab conversation continuity is
+  intentionally lost until multi-root stacks are proven necessary.
+- Demo states may drift if C5/C3 models change shape � changes then REQUIRE updating page-plan P3/P4/P5
+  model declarations in the same commit.
+
+### Revisit when
+Two-pane expanded layout (UI-034 pass), deep links (notification -> conversation), or >6 destinations.

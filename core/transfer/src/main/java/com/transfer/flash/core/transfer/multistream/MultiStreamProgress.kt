@@ -64,6 +64,15 @@ internal class RollingRateMeter(
     }
 
     /**
+     * Discards every sample. Used when transmission pauses and resumes: a window that straddles
+     * the paused gap divides real bytes by pause wall-clock and reports a bogus near-zero rate.
+     */
+    @Synchronized
+    fun reset() {
+        samples.clear()
+    }
+
+    /**
      * Bytes/sec across the sliding window ending at [atMs]; `-1.0` when no forward progress is
      * visible inside the window (stall ⇒ ETA hidden, not faked).
      */

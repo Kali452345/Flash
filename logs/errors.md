@@ -635,3 +635,93 @@ multistream tests in 1.3 s and is how ERROR-016 was first verified.
 
 ### Status
 RESOLVED (workaround is reliable and one-line; root cause is OS-side AF_UNIX blocking, outside the repo)
+
+## ERROR-018 - Sending device could not pause; paused transfers hung, failed, or deadlocked (RESOLVED)
+
+### Date
+2026-08-25
+
+### Area
+`core/transfer/.../RealFlashTransferRepository.kt`, `core/transfer/.../multistream/MultiStreamDispatcher.kt`,
+`core/transfer/.../multistream/MultiStreamProgress.kt`, `app/.../debug/DiscoveryEngineHolder.kt`
+
+### Symptoms
+Owner report: "the transferring device cannot pause". Observed/derived from a full audit of the
+pause/resume/cancel surface:
+- Tapping Pause on the SENDER did nothing - the row flipped to Paused for a moment and then went back to
+  Transferring while bytes kept flowing.
+- A transfer paused for more than ~15 s died with `ack drain timeout: N chunk(s) unconfirmed`.
+- Pausing the receiver, then resuming it, left the transfer at 0 B/s forever.
+- Speed/ETA kept counting down while paused; `-1` occasionally surfaced as the speed.
+- With two inbound transfers, resuming one un-gated the socket for both.
+
+### Root cause (nine distinct defects; 1 is the reported one)
+1. **Registration race - the reported bug.** `sendFile` returns as soon as the send coroutine is *launched*,
+   but `executeSend` only puts the dispatcher into `runningDispatchers` AFTER the resume-chunk DAO query and
+   dispatcher construction. `pauseTransfer` inside that window found no dispatcher, took a state-only branch,
+   and `executeSend` then wrote `Transferring` unconditionally - the pause was erased and no wire control
+   frame was sent either, so the peer never learned about it.
+2. **`send()` could hang forever.** The materializer and every worker polled `awaitUnpause()` unconditionally.
+   `send()` is a `coroutineScope` that joins all of them, so a terminal outcome reached DURING a pause (the
+   receiver's COMPLETE frame, or a cancel) left `send()` suspended with no exit but cancellation.
+3. **The 15 s ACK-drain grace killed paused transfers.** A paused receiver deliberately stops draining and
+   ACKing, so missing ACKs are expected - but `failIfAllChannelsDead`/`maybeResolveFromState` armed and
+   expired the deadline anyway and reported `ack drain timeout`.
+4. **Receiver-resume deadlock.** `onRemoteTransferControl` RESUME on the RECEIVING side never emitted
+   `IncomingControl(RESUME)`, so a receiver that had paused locally stayed intake-gated forever while its UI
+   claimed Transferring and the resumed sender blocked on backpressure at 0 B/s.
+5. **Session-wide intake gate was a boolean.** `DiscoveryEngineHolder.pausedIntake` gated the whole socket,
+   so resuming ONE inbound transfer un-gated every other paused one.
+6. **`resumeTransfer` no-oped on a state mismatch** (`state != Paused/Failed`) even when the dispatcher was
+   demonstrably paused - the wire stayed parked with no way back.
+7. **Negative speed reached the UI.** `RollingRateMeter` returns `-1.0` until two samples exist; that was
+   written straight into `speedBytesPerSec`.
+8. **Rate meter straddled the pause gap.** After resume, the window divided real bytes by pause wall-clock
+   and reported a bogus near-zero rate (plus an absurd ETA).
+9. **Silent control drops and asymmetric remote cancel.** `MutableSharedFlow.tryEmit` failures were
+   discarded unlogged; remote CANCEL on the sending side did not unpause before cancelling, and a `finally`
+   in `executeSend` could retire a *relaunched* transfer's registrations (orphaning the live transfer so
+   pause/resume/cancel stopped reaching it).
+
+### Working fix
+- **`pauseIntents: ConcurrentHashMap.newKeySet()`** in the repository, written BEFORE the dispatcher lookup.
+  `executeSend` calls `applyPendingPauseOrStart`, which checks the intent, writes `Transferring`, then
+  re-checks - the two orderings interleave so one side always observes the other and the pause cannot be
+  lost. `pauseTransfer` now has ONE outbound branch (intent + best-effort `setPaused` + state + wire frame),
+  so the peer is always told, dispatcher or not.
+- **`awaitUnpause()` returns early once `terminalDeferred` completes**, and workers `continue` (never `break`)
+  when the transfer is already resolved - they keep draining feeds to closure so the materializer is never
+  stranded, but never touch the wire again. `send()` now always returns.
+- **Paused transfers are exempt from the ACK-drain grace**: `failIfAllChannelsDead` skips arming while paused
+  and `maybeResolveFromState` DISARMS (`ackDrainDeadlineMs = null`) so resume starts a fresh window.
+- **`onRemoteTransferControl` RESUME (Receiving) emits `IncomingControl(RESUME)`**; PAUSE deliberately does
+  NOT gate (the gate is session-wide and the peer has already stopped, so gating would only stall unrelated
+  transfers' ACKs). Un-gating can never block anything, so it is safe and idempotent.
+- **`pausedIntakeIds: MutableStateFlow<Set<String>>`** replaces the boolean gate; the binary read loop waits
+  on `first { it.isEmpty() }`, so per-transfer resume only un-gates when nothing is left paused.
+- **`resumeTransfer` resumes on wire truth**, not tracked state: a live sender whose dispatcher `isPaused`
+  (or that still holds a pause intent) is always resumable; RESUME is sent to the peer BEFORE any relaunch.
+- **Telemetry honesty**: paused progress publishes a hard `0.0` rate and `-1` ETA; `speedBytesPerSec` is
+  `coerceAtLeast(0.0)`; new `RollingRateMeter.reset()` is called on resume to drop samples spanning the gap;
+  `setPaused` publishes immediately so the UI reflects the pause within one frame.
+- **`emitOutgoing`/`emitIncoming` log dropped intents**; remote CANCEL unpauses before cancelling; the
+  `executeSend` `finally` uses ownership-checked `runningDispatchers.remove(transferId, dispatcher)`.
+
+### Verification
+- 6 new regression tests, all green:
+  - `MultiStreamDispatcherTest`: pause-before-`send()` keeps the wire silent (0 chunk frames, 0 B, rate 0.0,
+    ETA -1) and resume delivers all 19 chunks byte-identical; a COMPLETE frame arriving WHILE paused returns
+    from `send()` instead of parking (would have hung forever pre-fix); a paused sender survives repeated
+    60 s fake-clock jumps past the drain grace, and only after resume fails with `ack drain timeout`.
+  - `RealFlashTransferRepositoryTest`: a pause issued while the resume-chunk DAO query is still parked (i.e.
+    before the dispatcher is registered) leaves the transfer Paused with 0 chunks on the wire and completes
+    all 8 chunks after resume; a remote PAUSE parks a live sender after only the in-flight chunk and remote
+    RESUME finishes it with `errorMessage` cleared; cancelling a PAUSED sender settles on Cancelled and the
+    wire goes quiet.
+- `:core:transfer:testDebugUnitTest --rerun` BUILD SUCCESSFUL - 76 tests, 0 failures.
+- Full `testDebugUnitTest assembleDebug` BUILD SUCCESSFUL, 411 tasks, 668 tests / 0 failures / 0 skipped
+  across all test modules; `app-debug.apk` produced.
+- NOT device-verified: the two-phone pause/resume/cancel round trip stays on the owner backlog (EXP-002).
+
+### Status
+RESOLVED (2026-08-25) - code-level; device confirmation pending

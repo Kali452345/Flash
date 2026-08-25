@@ -2,31 +2,62 @@ package com.transfer.flash.core.transfer
 
 import com.transfer.flash.core.common.model.FlashDevice
 import com.transfer.flash.core.common.result.FlashResult
+import com.transfer.flash.core.persistence.db.dao.TransferChunkDao
+import com.transfer.flash.core.persistence.db.entity.TransferChunkEntity
 import com.transfer.flash.core.transfer.chunked.ChunkFrame
 import com.transfer.flash.core.transfer.chunked.Chunker
+import com.transfer.flash.core.transfer.model.FlashTransfer
+import com.transfer.flash.core.transfer.model.FlashTransferId
 import com.transfer.flash.core.transfer.model.FlashTransferState
 import com.transfer.flash.core.transfer.multistream.StreamChannel
 import com.transfer.flash.core.transfer.multistream.StreamChannelFactory
 import java.io.ByteArrayInputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RealFlashTransferRepositoryTest {
 
-    private val executor = Executors.newFixedThreadPool(4)
+    private val executor = Executors.newFixedThreadPool(8)
     private val testDispatcher = executor.asCoroutineDispatcher()
+    private val scopes = mutableListOf<CoroutineScope>()
 
     @After
     fun tearDown() {
+        scopes.forEach { runCatching { it.cancel() } }
+        scopes.clear()
         executor.shutdownNow()
+    }
+
+    /** Repository scope tied to the test executor and torn down with the test. */
+    private fun newScope(): CoroutineScope =
+        CoroutineScope(testDispatcher + SupervisorJob()).also { scopes.add(it) }
+
+    private fun RealFlashTransferRepository.snapshot(id: FlashTransferId): FlashTransfer =
+        activeTransfers.value.first { it.id == id }
+
+    private fun awaitUntil(timeoutMs: Long = 20_000, describe: () -> String, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            if (System.currentTimeMillis() > deadline) {
+                throw AssertionError("condition timeout: " + describe())
+            }
+            Thread.sleep(5)
+        }
     }
 
     @Test
@@ -97,5 +128,209 @@ class RealFlashTransferRepositoryTest {
 
         val cancelledList = repo.activeTransfers.value
         assertEquals(FlashTransferState.Cancelled, cancelledList.first().state)
+    }
+
+    // ---- pause / resume / cancel (ADR-018) ------------------------------------------------
+
+    /** 512 KB = exactly 8 chunks at [Chunker.DEFAULT_CHUNK_SIZE_BYTES]. */
+    private val eightChunkPayload = ByteArray(512 * 1024) { (it % 251).toByte() }
+
+    private val peer = FlashDevice(
+        id = com.transfer.flash.core.common.model.FlashDeviceId("target-peer-pause"),
+        friendlyName = "Pixel 9 Pro",
+        transportType = com.transfer.flash.core.common.model.FlashTransportType.LAN,
+    )
+
+    /**
+     * Chunk DAO whose resume query parks until released — reproduces the exact window `sendFile`
+     * returns into, where the send coroutine is live but its dispatcher is not registered yet.
+     */
+    private class GatedChunkDao(val open: AtomicBoolean = AtomicBoolean(false)) : TransferChunkDao {
+        override suspend fun insertAll(chunks: List<TransferChunkEntity>) = Unit
+        override suspend fun markChunkDone(transferId: String, chunkIndex: Int) = Unit
+        override suspend fun resetStuck(transferId: String) = Unit
+        override suspend fun doneChunks(transferId: String): List<Int> {
+            while (!open.get()) delay(5)
+            return emptyList()
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `pause issued before the dispatcher is registered is applied, not silently lost`() = runBlocking {
+        val dao = GatedChunkDao()
+        val chunksOnWire = AtomicInteger(0)
+        lateinit var repo: RealFlashTransferRepository
+        val factory = StreamChannelFactory { channelId, _ ->
+            object : StreamChannel {
+                override val id: Int = channelId
+                override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
+                    val parsed = ChunkFrame.parse(frameBytes)
+                    if (parsed is ChunkFrame.Chunk) {
+                        chunksOnWire.incrementAndGet()
+                        repo.onInboundFrame(
+                            ChunkFrame.serialize(
+                                ChunkFrame.AckBatch(parsed.transferId, parsed.fileId, listOf(parsed.index)),
+                            ),
+                        )
+                    }
+                    return true
+                }
+            }
+        }
+        repo = RealFlashTransferRepository(
+            chunker = Chunker(),
+            streamChannelFactory = factory,
+            fileSourceOpener = { ByteArrayInputStream(eightChunkPayload) },
+            transferChunkDao = dao,
+            repositoryScope = newScope(),
+            workerDispatcher = testDispatcher,
+            defaultStreams = 1,
+        )
+
+        val transferId = (
+            repo.sendFile(peer, "content://media/paused.bin", "paused.bin", eightChunkPayload.size.toLong())
+                as FlashResult.Success
+            ).value
+
+        // Dispatcher does not exist yet: the pre-fix code flipped state to Paused and then had it
+        // overwritten by executeSend's unconditional Transferring write.
+        assertTrue(repo.pauseTransfer(transferId) is FlashResult.Success)
+        assertEquals(FlashTransferState.Paused, repo.snapshot(transferId).state)
+
+        dao.open.set(true) // executeSend proceeds: builds + registers the dispatcher
+        Thread.sleep(600) // well past dispatcher construction, hashing and worker start-up
+
+        assertEquals(
+            "pause must survive dispatcher construction",
+            FlashTransferState.Paused,
+            repo.snapshot(transferId).state,
+        )
+        assertEquals("no chunk may reach the wire while paused", 0, chunksOnWire.get())
+        assertEquals(0L, repo.snapshot(transferId).speedBytesPerSec)
+
+        assertTrue(repo.resumeTransfer(transferId) is FlashResult.Success)
+        awaitUntil(describe = { "state=" + repo.snapshot(transferId).state + " chunks=" + chunksOnWire.get() }) {
+            repo.snapshot(transferId).state == FlashTransferState.Completed
+        }
+        assertEquals(8, chunksOnWire.get())
+        assertEquals(eightChunkPayload.size.toLong(), repo.snapshot(transferId).bytesDone)
+        Unit
+    }
+
+    @Test(timeout = 60_000)
+    fun `remote pause parks a live sender and remote resume finishes it with the notice cleared`() = runBlocking {
+        val firstChunkGate = CompletableDeferred<Unit>()
+        val gateEntered = AtomicBoolean(false)
+        val chunksOnWire = AtomicInteger(0)
+        lateinit var repo: RealFlashTransferRepository
+        val factory = StreamChannelFactory { channelId, _ ->
+            object : StreamChannel {
+                override val id: Int = channelId
+                override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
+                    val parsed = ChunkFrame.parse(frameBytes)
+                    if (parsed is ChunkFrame.Chunk) {
+                        // Hold the worker inside the wire write for the first chunk: the dispatcher
+                        // is fully registered and running, which is what a remote PAUSE must hit.
+                        if (gateEntered.compareAndSet(false, true)) firstChunkGate.await()
+                        chunksOnWire.incrementAndGet()
+                        repo.onInboundFrame(
+                            ChunkFrame.serialize(
+                                ChunkFrame.AckBatch(parsed.transferId, parsed.fileId, listOf(parsed.index)),
+                            ),
+                        )
+                    }
+                    return true
+                }
+            }
+        }
+        repo = RealFlashTransferRepository(
+            chunker = Chunker(),
+            streamChannelFactory = factory,
+            fileSourceOpener = { ByteArrayInputStream(eightChunkPayload) },
+            repositoryScope = newScope(),
+            workerDispatcher = testDispatcher,
+            defaultStreams = 1,
+        )
+
+        val transferId = (
+            repo.sendFile(peer, "content://media/remote.bin", "remote.bin", eightChunkPayload.size.toLong())
+                as FlashResult.Success
+            ).value
+        awaitUntil(describe = { "worker never reached the wire" }) { gateEntered.get() }
+
+        repo.onRemoteTransferControl(transferId.value, RealFlashTransferRepository.ACTION_PAUSE)
+        assertEquals(FlashTransferState.Paused, repo.snapshot(transferId).state)
+        assertEquals("paused by receiver", repo.snapshot(transferId).errorMessage)
+
+        firstChunkGate.complete(Unit) // in-flight chunk lands, then the worker must park
+        Thread.sleep(600)
+        assertEquals("only the in-flight chunk may land after a remote pause", 1, chunksOnWire.get())
+        assertEquals(FlashTransferState.Paused, repo.snapshot(transferId).state)
+
+        repo.onRemoteTransferControl(transferId.value, RealFlashTransferRepository.ACTION_RESUME)
+        awaitUntil(describe = { "state=" + repo.snapshot(transferId).state + " chunks=" + chunksOnWire.get() }) {
+            repo.snapshot(transferId).state == FlashTransferState.Completed
+        }
+        assertEquals(8, chunksOnWire.get())
+        assertNull("the pause notice must not outlive the resume", repo.snapshot(transferId).errorMessage)
+        Unit
+    }
+
+    @Test(timeout = 60_000)
+    fun `cancel unparks a paused sender so the job actually stops`() = runBlocking {
+        val dao = GatedChunkDao(AtomicBoolean(true))
+        val chunksOnWire = AtomicInteger(0)
+        val gateEntered = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        lateinit var repo: RealFlashTransferRepository
+        val factory = StreamChannelFactory { channelId, _ ->
+            object : StreamChannel {
+                override val id: Int = channelId
+                override suspend fun sendFrame(frameBytes: ByteArray): Boolean {
+                    if (ChunkFrame.parse(frameBytes) is ChunkFrame.Chunk) {
+                        if (gateEntered.compareAndSet(false, true)) gate.await()
+                        chunksOnWire.incrementAndGet()
+                    }
+                    return true // never ACKs: the transfer cannot finish on its own
+                }
+            }
+        }
+        repo = RealFlashTransferRepository(
+            chunker = Chunker(),
+            streamChannelFactory = factory,
+            fileSourceOpener = { ByteArrayInputStream(eightChunkPayload) },
+            transferChunkDao = dao,
+            repositoryScope = newScope(),
+            workerDispatcher = testDispatcher,
+            defaultStreams = 1,
+        )
+
+        val transferId = (
+            repo.sendFile(peer, "content://media/cancel.bin", "cancel.bin", eightChunkPayload.size.toLong())
+                as FlashResult.Success
+            ).value
+        awaitUntil(describe = { "worker never reached the wire" }) { gateEntered.get() }
+
+        assertTrue(repo.pauseTransfer(transferId) is FlashResult.Success)
+        gate.complete(Unit)
+        Thread.sleep(400)
+        assertEquals(FlashTransferState.Paused, repo.snapshot(transferId).state)
+        assertEquals("only the in-flight chunk may land after a pause", 1, chunksOnWire.get())
+
+        // Cancelling a PAUSED sender must unpause first, otherwise workers re-park in the pause
+        // poll loop and the job never reaches a cancellable suspension point. Both the state and
+        // the wire have to settle: nothing may re-label this Failed via the ack-drain grace.
+        assertTrue(repo.cancelTransfer(transferId) is FlashResult.Success)
+        assertEquals(FlashTransferState.Cancelled, repo.snapshot(transferId).state)
+        Thread.sleep(600)
+        val settled = chunksOnWire.get()
+        Thread.sleep(400)
+        assertEquals("the wire must go quiet after a cancel", settled, chunksOnWire.get())
+        assertEquals(
+            "Cancelled is terminal: the ack-drain grace must not overwrite it",
+            FlashTransferState.Cancelled,
+            repo.snapshot(transferId).state,
+        )
+        Unit
     }
 }
