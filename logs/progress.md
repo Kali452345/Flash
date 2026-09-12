@@ -1,5 +1,19 @@
 # Progress Log
 
+## 2026-09-12 — Micro-UX & Accessibility: FlashReactionChip Tactile Feedback & Design System Text
+
+### Worked on
+Enhanced `FlashReactionChip` (`ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashReactionChip.kt`) for improved micro-UX, tactile press feel, and strict Flash design system compliance.
+
+### Changed
+- Replaced stock `material3.Text` with `FlashText` primitive styled via `FlashTypography` and `FlashColors`.
+- Added tactile spring press scaling (`.flashPressScale(interactionSource)`) using `FlashMotion` springs.
+- Passed `interactionSource` to `combinedClickable` for synchronized touch states.
+
+### Verified
+- `./gradlew :ui:chat:jvmTest :app:testDebugUnitTest` passed cleanly.
+- `git diff --check` verified clean without trailing whitespace or formatting issues.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
