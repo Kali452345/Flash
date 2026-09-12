@@ -1,5 +1,20 @@
 # Progress Log
 
+## 2026-09-12 — Sentinel: IndexOutOfBoundsException Fix in Base64 Codec
+
+### Worked on
+Investigated Base64 decoder (`Base64.kt`) char lookup for unhandled exceptions on non-ASCII input.
+
+### Changed
+- Added bounds check `c.code in 0..255` in `Base64.decodeChar(c)` (`core/common/src/commonMain/kotlin/com/transfer/flash/core/common/protocol/Base64.kt`) so non-ASCII input (>0xFF) throws `IllegalArgumentException` as contractually required instead of `IndexOutOfBoundsException` (`ArrayIndexOutOfBoundsException`).
+- Added `// SENTINEL:` comment explaining the threat and fix.
+- Added regression test `decode_non_ascii_char_throws_illegal_argument` in `Base64Test.kt` (`core/common/src/androidHostTest/kotlin/com/transfer/flash/core/common/protocol/Base64Test.kt`).
+
+### Verification
+- Ran `./gradlew :core:common:testAndroidHostTest` — `Base64Test` passed clean.
+- Ran `./gradlew :core:calling:testDebugUnitTest :core:messaging:jvmTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug`.
+- Ran `git diff --check` — clean with zero whitespace errors.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
