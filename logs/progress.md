@@ -1,5 +1,19 @@
 # Progress Log
 
+## 2026-09-12 — ⚡ Bolt: Fix infinite loop & OOM fallback in FlashImageDecoder
+
+### Worked on
+Investigated bitmap decoding in `ui/platform-shims/src/androidMain/kotlin/com/transfer/flash/ui/shims/FlashImageDecoder.android.kt` for potential OOM errors and thread spin loops on low-end devices (2GB RAM).
+
+### Changed
+- In `decodeImage()`, updated `localFile` and `content://` (ParcelFileDescriptor) decode `while` loops to handle `null` returns from `BitmapFactory.decodeFile` and `BitmapFactory.decodeFileDescriptor`.
+- On `null` return or `OutOfMemoryError`, step `sample *= 2` and switch `inPreferredConfig` to `Bitmap.Config.RGB_565`, preventing an infinite `while` loop on background threads when decoding corrupt, truncated, or memory-restricted image files on low-end devices.
+- Added a `// BOLT:` comment explaining the root cause, fix, and expected performance impact (~50% heap memory reduction per OOM retry and elimination of 100% CPU thread spin).
+
+### Verification
+- Executed `./gradlew :core:messaging:jvmTest :core:messaging:testAndroidHostTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug` — BUILD SUCCESSFUL.
+- `git diff --check` passed clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
