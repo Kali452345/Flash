@@ -1,5 +1,20 @@
 # Progress Log
 
+## 2026-09-13 — ⚡ Bolt: Message Bubble Press Scale Animation Phase Deferral
+
+### Worked on
+Deferred `pressScale` State reading in `FlashMessageBubble.kt` to the GraphicsLayer (draw) phase to eliminate unnecessary recompositions during press/release spring animations.
+
+### Changed
+- `ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashMessageBubble.kt`:
+  - Changed `val pressScale by animateFloatAsState(...)` to `val pressScale = animateFloatAsState(...)` (holding `State<Float>`).
+  - Updated `scaleX` and `scaleY` in `graphicsLayer { ... }` to read `pressScale.value` directly inside the draw phase.
+  - Added a `// BOLT:` performance annotation comment explaining the optimization and expected impact.
+
+### Verification
+- Executed `./gradlew :core:messaging:jvmTest :core:messaging:testAndroidHostTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug` — BUILD SUCCESSFUL (all tests passed).
+- Executed `git diff --check` — clean with zero whitespace errors.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
