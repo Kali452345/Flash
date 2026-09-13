@@ -1652,6 +1652,7 @@ object DiscoveryEngineHolder {
                     replyToId = msgFields["replyToId"]?.ifBlank { null },
                     replyToPreview = msgFields["replyToPreview"]?.ifBlank { null },
                 ),
+                transportPeerId = peerDeviceId,
             )
             return
         }
@@ -1664,6 +1665,7 @@ object DiscoveryEngineHolder {
                     memberId = receiptFields["memberId"] ?: "",
                     deliveredAt = receiptFields["deliveredAt"]?.toLongOrNull() ?: System.currentTimeMillis(),
                 ),
+                transportPeerId = peerDeviceId,
             )
             return
         }
@@ -1676,6 +1678,7 @@ object DiscoveryEngineHolder {
                     upToMessageId = readFields["upToMessageId"] ?: return,
                     readAt = readFields["readAt"]?.toLongOrNull() ?: System.currentTimeMillis(),
                 ),
+                transportPeerId = peerDeviceId,
             )
             return
         }
@@ -1689,6 +1692,7 @@ object DiscoveryEngineHolder {
                     emoji = reactFields["emoji"] ?: return,
                     isAdded = reactFields["isAdded"]?.toBooleanStrictOrNull() ?: true,
                 ),
+                transportPeerId = peerDeviceId,
             )
             return
         }
