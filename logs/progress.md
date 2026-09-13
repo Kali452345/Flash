@@ -1,5 +1,25 @@
 # Progress Log
 
+## 2026-09-12 - 🛡️ Sentinel: Direct Frame Transport Identity Verification
+
+### Worked on
+Fixed a HIGH-severity transport identity spoofing vulnerability where direct chat frames (`TextMessage`, `DeliveryReceipt`, `ReadReceipt`, `ReactionFrame`) failed to verify `transportPeerId` against the claimed payload author (`senderId` / `memberId`).
+
+### Changed
+- `core/messaging/src/androidMain/kotlin/com/transfer/flash/core/messaging/RealFlashChatRepository.kt`:
+  - Enforced fail-closed validation on inbound direct wire frames (`TextMessage`, `DeliveryReceipt`, `ReadReceipt`, `ReactionFrame`) when `transportPeerId != null`: if `transportPeerId != frame.senderId` or `transportPeerId != frame.memberId`, the frame is dropped silently.
+  - Added `// SENTINEL:` threat model & security comment explaining the transport-peer validation rule.
+- `app/src/main/java/com/transfer/flash/debug/DiscoveryEngineHolder.kt` & `core/engine/src/androidMain/kotlin/com/transfer/flash/core/engine/Flash.kt`:
+  - Updated all `onInboundWireFrame` invocation sites to pass `transportPeerId = peerDeviceId`.
+- `core/messaging/src/androidHostTest/kotlin/com/transfer/flash/core/messaging/RealFlashChatRepositoryTest.kt`:
+  - Added regression test `onInboundWireFrame drops frames when transportPeerId does not match claim author` verifying that spoofed text messages, delivery receipts, and reaction frames are dropped while valid or null `transportPeerId` frames are processed normally.
+
+### Verification
+- `./gradlew :core:messaging:jvmTest :core:messaging:testAndroidHostTest :ui:chat:jvmTest :app:testDebugUnitTest` — BUILD SUCCESSFUL (all unit and host tests passed).
+- `./gradlew :app:assembleDebug` — BUILD SUCCESSFUL.
+- `git diff --check` — clean.
+- Physical-device test gate remaining per AGENTS.md §12.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
