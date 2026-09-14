@@ -1,5 +1,22 @@
 # Progress Log
 
+## 2026-09-13 — Sentinel: Path Traversal Guard in FlashImageDecoder (CRITICAL Defense)
+
+### Worked on
+Added path traversal guard and canonical file normalization in `resolveLocalFile` and `openStream` within `FlashImageDecoder.android.kt` (`:ui:platform-shims`).
+
+### Changed
+- `ui/platform-shims/src/androidMain/kotlin/com/transfer/flash/ui/shims/FlashImageDecoder.android.kt`:
+  - Added `// SENTINEL: Path traversal guard — canonical normalization & file validation for media decoder sources` comment.
+  - Updated `resolveLocalFile` to normalize `file.canonicalFile` and verify `exists() && isFile && length() > 0L`.
+  - Refactored `openStream` and `decodeVideoFrame` local file paths to route through `resolveLocalFile` to ensure safe file resolution.
+- `ui/platform-shims/src/androidHostTest/kotlin/com/transfer/flash/ui/shims/FlashMediaDecoderSecurityTest.kt`:
+  - Added security unit tests verifying that non-existent/invalid file paths are safely rejected and canonical path normalization holds.
+
+### Verification
+- Tested unit test file `FlashMediaDecoderSecurityTest.kt` in `:ui:platform-shims:androidHostTest`.
+- Physical-device test gate remaining per AGENTS.md §12.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
