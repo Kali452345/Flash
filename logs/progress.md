@@ -1,5 +1,18 @@
 # Progress Log
 
+## 2026-09-12 — Micro-UX Improvement: FlashReactionChip Tactile Feedback & Design Token Compliance
+
+### Worked on
+Implemented micro-UX and accessibility enhancements on reaction chips (`FlashReactionChip.kt`).
+
+### Changed
+- Replaced stock `material3.Text` usages with `FlashText` in `FlashReactionChip.kt` to comply with Flash design system guidelines.
+- Added tactile spring press scale feedback (`Modifier.flashPressScale(interactionSource)`) to `FlashReactionChip` and passed the shared `interactionSource` to `combinedClickable`.
+
+### Verified
+- `JAVA_TOOL_OPTIONS="-Djdk.net.unixdomain.tmpdir=/tmp" ./gradlew :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug` passed cleanly.
+- `git diff --check` clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
