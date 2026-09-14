@@ -1,5 +1,20 @@
 # Progress Log
 
+## 2026-09-12 — ⚡ Bolt: LazyColumn Chat Item Recycling & Conversation State Reset
+
+### Worked on
+Optimized LazyColumn chat item recycling and state tracking in `FlashMessageList.kt` to eliminate item recycling layout thrashing and prevent stale initial message ID state leaks across conversation switches on low-end devices.
+
+### Changed
+- `ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashMessageList.kt`:
+  - Differentiated `isMine` in `flashMessageContentType(message)` (`"text_out"`, `"text_in"`, etc.) so `LazyColumn` item composition recycling reuses matching incoming vs outgoing bubble composables without layout or shape thrashing.
+  - Keyed `initialMessageIds` on `messages.firstOrNull()?.id` so message ID initial state resets when opening/switching conversations.
+  - Added `// BOLT:` performance annotation comment detailing the changes and expected impact.
+
+### Verified
+- `./gradlew :core:messaging:jvmTest :core:messaging:testAndroidHostTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug --no-configuration-cache` — BUILD SUCCESSFUL.
+- `git diff --check` — clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
