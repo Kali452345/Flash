@@ -1,5 +1,24 @@
 # Progress Log
 
+## 2026-09-12 — ⚡ Bolt: Chat list LazyColumn contentType recycling & swipe closure bug fix
+
+### Worked on
+Optimized LazyColumn composition slot recycling on chat list screen and fixed a stale closure capture bug in swipe-to-dismiss archive action.
+
+### Changed
+- `ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashChatListScreen.kt`:
+  - Added `contentType = { _, item -> if (item.isGroup) "group" else "direct" }` to `itemsIndexed` so LazyColumn reuses item composition slots accurately during scrolling.
+  - Added `// BOLT:` performance annotation comment.
+- `ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashChatListRow.kt`:
+  - Fixed stale closure capture bug in `rememberSwipeToDismissBoxState`'s `confirmValueChange` lambda by using `rememberUpdatedState` for `item.id` and `onArchive` so swiping recycled or updated rows always acts on the current item ID.
+  - Replaced stock `material3.Text` usages with design system `FlashText` (using `BasicText` with draw-phase `ColorProducer`).
+  - Removed stock `material3.Text` import.
+  - Added `// BOLT:` performance annotation comment.
+
+### Verification
+- `./gradlew :core:messaging:jvmTest :core:messaging:testAndroidHostTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug` — BUILD SUCCESSFUL (all tests passed).
+- `git diff --check` — clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
