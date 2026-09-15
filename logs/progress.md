@@ -1,5 +1,18 @@
 # Progress Log
 
+## 2026-09-12 — 🎨 Palette: Tactile Press Scale & FlashText Design Tokens in FlashReactionChip
+
+### Worked on
+Enhanced `FlashReactionChip.kt` with Flash design tokens (`FlashText`) and tactile press scale feedback (`flashPressScale`).
+
+### Changed
+- Replaced stock `material3.Text` with `FlashText` design system primitive in `FlashReactionChip.kt` to comply with Flash design system guidelines.
+- Added tactile press scale feedback (`.flashPressScale(interactionSource, pressedScale = 0.94f)`) using a shared `MutableInteractionSource` passed to both `flashPressScale` and `combinedClickable`.
+
+### Verified
+- `./gradlew :ui:chat:jvmTest :app:testDebugUnitTest` passed successfully.
+- `git diff --check` clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
