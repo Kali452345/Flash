@@ -1,5 +1,22 @@
 # Progress Log
 
+## 2026-09-12 — Sentinel: Fail-closed fingerprint validation in pairing state machine
+
+### Worked on
+Fixed a HIGH severity crash / unvalidated fingerprint pinning vulnerability in `PairingSessionStateMachine.kt`. Unauthenticated peers sending malformed or blank identity fingerprints in `PAIR_REQUEST` frames previously triggered uncaught `IllegalArgumentException` in `NumericComparisonCode.derive()`, causing denial-of-service or potential unvalidated state transitions.
+
+### Changed
+- `core/security/src/main/java/com/transfer/flash/core/security/pairing/PairingSessionStateMachine.kt`:
+  - Added fail-closed normalization and validation checks for `peerFingerprintHex` and `localFingerprintHex` on `PairingSessionEvent.RequestReceived`, `PairingSessionEvent.BeginRequested`, and `PairingSessionEvent.Paired`.
+  - Transitioned invalid fingerprint inputs directly to `PairingPhase.Failed(failureReason = "invalid-fingerprint")`.
+  - Included mandatory `// SENTINEL:` security explanation comments detailing threat and fix.
+- `core/security/src/test/java/com/transfer/flash/core/security/pairing/PairingSessionStateMachineTest.kt`:
+  - Added unit test coverage for invalid/blank fingerprint inputs across `RequestReceived`, `BeginRequested`, and `Paired` events.
+
+### Verification
+- Ran `./gradlew :core:security:testAndroidHostTest :core:messaging:jvmTest :ui:chat:jvmTest :app:testDebugUnitTest :app:assembleDebug` — BUILD SUCCESSFUL (all unit and host tests passed).
+- `git diff --check` — clean.
+
 ## 2026-09-12 - Landed PRs #3/#4/#5 locally (CI is dark); discovered CI never ran the KMP test suites
 
 ### Worked on
