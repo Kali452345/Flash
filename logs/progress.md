@@ -1,5 +1,19 @@
 # Progress Log
 
+## 2026-09-16 - Palette: Reaction Overflow Badge Tactile Feedback & FlashText Token Compliance
+
+### Worked on
+Enhanced the reaction overflow badge (`+$overflowCount`) in `FlashReactionsDock.kt` with tactile spring press scale feedback and replaced stock Material 3 `Text` with design system token `FlashText`.
+
+### Changed
+- `ui/chat/src/commonMain/kotlin/com/transfer/flash/ui/chat/FlashReactionsDock.kt`:
+  - Added `.flashPressScale(interactionSource, pressedScale = 0.94f)` to the reaction overflow badge container `Box` with shared `MutableInteractionSource`.
+  - Replaced stock `material3.Text` with Flash token `FlashText`.
+
+### Verification
+- `./gradlew :ui:chat:jvmTest :app:testDebugUnitTest` passed successfully.
+- `git diff --check` passed clean.
+
 ## 2026-09-16 - Owner live-verified desktop voice playback; session handoff refreshed
 
 ### Worked on
