@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -33,9 +34,7 @@ import androidx.compose.ui.unit.dp
 import com.transfer.flash.core.messaging.model.FlashReaction
 import com.transfer.flash.ui.theme.FlashDimensions
 import com.transfer.flash.ui.theme.FlashSpacing
-import com.transfer.flash.ui.theme.FlashText
 import com.transfer.flash.ui.theme.FlashTheme
-import com.transfer.flash.ui.theme.flashPressScale
 import org.jetbrains.compose.ui.tooling.preview.Preview
 
 private const val MAX_DISPLAYED_REACTION_CHIPS = 8
@@ -85,16 +84,14 @@ fun FlashReactionsDock(
         }
 
         if (overflowCount > 0) {
-            val interactionSource = remember { MutableInteractionSource() }
             Box(
                 modifier = Modifier
                     .sizeIn(minWidth = 28.dp, minHeight = 28.dp)
-                    .flashPressScale(interactionSource, pressedScale = 0.94f)
                     .clip(CircleShape)
                     .background(colors.backgroundSurfaceSubtle)
                     .border(FlashDimensions.borderHairline, colors.borderSubtle, CircleShape)
                     .clickable(
-                        interactionSource = interactionSource,
+                        interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                         onClick = onOverflowClick,
                     )
@@ -105,7 +102,7 @@ fun FlashReactionsDock(
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                FlashText(
+                Text(
                     text = "+$overflowCount",
                     style = typography.metadataEmphasis,
                     color = colors.textSecondary,
